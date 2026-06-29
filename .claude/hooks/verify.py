@@ -34,7 +34,7 @@ TAIL = 1000  # 每項失敗輸出尾段上限(字元)
 SRC_EXT = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".ino", ".py", ".S", ".s",
            ".js", ".ts", ".jsx", ".tsx", ".sh", ".plist", ".xml", ".json",
            ".txt", ".yml", ".yaml", ".dsl", ".aml", ".xlsx", ".deb", ".css", ".html")
-SKIP_DIRS = {".git", "build", ".pio", "node_modules", ".claude",
+SKIP_DIRS = {".git", "build", ".pio", "node_modules", ".claude", ".vscode",
              "managed_components", "dist", ".cache", "__pycache__"}
 JSONC_DENY = {"tsconfig.json", "jsconfig.json", "devcontainer.json"}
 
@@ -155,7 +155,9 @@ def check_json(project):
     fails = []
     for f in files:
         try:
-            json.loads(f.read_text(encoding="utf-8"))
+            # utf-8-sig 容忍 UTF-8 BOM(Windows 編輯器常見);.vscode 等 JSONC
+            # 已由 SKIP_DIRS 排除,避免把合法的註解/尾逗號誤判為損毀。
+            json.loads(f.read_text(encoding="utf-8-sig"))
         except Exception as e:
             fails.append(f"JSON 不合法:{f.name} — {e}")
     return ("JSON", "\n".join(fails) if fails else None)

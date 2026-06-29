@@ -53,7 +53,9 @@ touch .claude/skip-verify   # 用完刪掉
 
 ## 運作機制
 
-Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":...}` 讓 Claude 續跑修正；以 `stop_hook_active` 防無限迴圈，並受 Claude Code 內建連續 block 上限（預設 8）保護，不會卡死 session。
+Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":...}`（Stop 事件用 top-level `decision`/`reason`，非 `hookSpecificOutput`）讓 Claude 續跑修正。防無限迴圈靠 `stop_hook_active`：第一次 Stop 被擋後 Claude 重跑修正，下一次 Stop 事件的 `stop_hook_active` 為 true，hook 立即 exit 0 放行 —— 每段工作只擋一次。
+
+> 注意：Claude Code **並無**固定的「連續 block 上限」數字；唯一可靠的防迴圈就是 hook 自己檢查 `stop_hook_active`（本 kit 已於 `verify.py` 第一步實作）。若 hook 不做此檢查，曾有回報導致無限迴圈跑到吃光整個 session。
 
 ## 授權
 
