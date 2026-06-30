@@ -1,6 +1,7 @@
 # Claude Code 本機狀態(不進版控)
 .claude/.last_verify_ok
 .claude/skip-verify
+.claude/plan.md
 
 # OS / 編輯器雜物
 .DS_Store

@@ -22,18 +22,21 @@ apply_one() {
   cd "$repo" 2>/dev/null || { echo "❌ 進不去,跳過"; return; }
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "❌ 不是 git repo,跳過"; return; }
 
-  mkdir -p .claude/hooks
-  cp "$SRC/CLAUDE.md"               ./CLAUDE.md
-  cp "$SRC/.claude/settings.json"  ./.claude/settings.json
-  cp "$SRC/.claude/hooks/verify.py" ./.claude/hooks/verify.py
-  chmod +x .claude/hooks/verify.py 2>/dev/null || true
+  mkdir -p .claude/hooks .claude/skills/codex-review
+  cp "$SRC/CLAUDE.md"                   ./CLAUDE.md
+  cp "$SRC/.claude/settings.json"      ./.claude/settings.json
+  cp "$SRC/.claude/hooks/verify.py"     ./.claude/hooks/verify.py
+  cp "$SRC/.claude/hooks/plan-review.py" ./.claude/hooks/plan-review.py
+  cp "$SRC/.claude/skills/codex-review/SKILL.md" ./.claude/skills/codex-review/SKILL.md
+  chmod +x .claude/hooks/verify.py .claude/hooks/plan-review.py 2>/dev/null || true
 
   touch .gitignore
-  for line in ".claude/.last_verify_ok" ".claude/skip-verify"; do
+  for line in ".claude/.last_verify_ok" ".claude/skip-verify" ".claude/plan.md"; do
     grep -qxF "$line" .gitignore || echo "$line" >> .gitignore
   done
 
-  git add CLAUDE.md .claude/settings.json .claude/hooks/verify.py .gitignore
+  git add CLAUDE.md .claude/settings.json .claude/hooks/verify.py \
+          .claude/hooks/plan-review.py .claude/skills/codex-review/SKILL.md .gitignore
   if git diff --cached --quiet; then echo "ℹ️  無變更,略過。"; return; fi
   git commit -m "chore(claude): add Stop-hook verifier + CLAUDE.md working contract"
   echo "✅ 已 commit(本機)。"

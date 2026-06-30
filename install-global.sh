@@ -6,10 +6,12 @@ set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="${HOME}/.claude"
 
-mkdir -p "$DEST/hooks"
-cp "$SRC/CLAUDE.md"               "$DEST/CLAUDE.md"
-cp "$SRC/.claude/hooks/verify.py" "$DEST/hooks/verify.py"
-chmod +x "$DEST/hooks/verify.py"
+mkdir -p "$DEST/hooks" "$DEST/skills/codex-review"
+cp "$SRC/CLAUDE.md"                    "$DEST/CLAUDE.md"
+cp "$SRC/.claude/hooks/verify.py"      "$DEST/hooks/verify.py"
+cp "$SRC/.claude/hooks/plan-review.py" "$DEST/hooks/plan-review.py"
+cp "$SRC/.claude/skills/codex-review/SKILL.md" "$DEST/skills/codex-review/SKILL.md"
+chmod +x "$DEST/hooks/verify.py" "$DEST/hooks/plan-review.py"
 
 # 全域 settings.json:hook 指向 ~/.claude/hooks/verify.py
 # 若已存在則備份,避免覆蓋你既有設定。
@@ -23,6 +25,11 @@ cat > "$DEST/settings.json" <<'JSON'
     "Stop": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/plan-review.py",
+            "timeout": 60
+          },
           {
             "type": "command",
             "command": "python3 ~/.claude/hooks/verify.py",

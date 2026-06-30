@@ -57,6 +57,20 @@ Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":
 
 > 注意：Claude Code **並無**固定的「連續 block 上限」數字；唯一可靠的防迴圈就是 hook 自己檢查 `stop_hook_active`（本 kit 已於 `verify.py` 第一步實作）。若 hook 不做此檢查，曾有回報導致無限迴圈跑到吃光整個 session。
 
+## Cross-Model 計劃審查（Claude ↔ Codex）
+
+第二個、與上面**職責不同**的 Stop hook 閘門:`verify.py` 審「完成的程式碼能否編譯/測試」（交付前），`plan-review.py` 審「**實作計劃的邏輯漏洞**」（動手前）。讓創意的 Claude 主寫、讓穩定的 Codex 當無情 Reviewer。
+
+運作(harness 自動化,無需人肉複製貼上):
+1. Claude 把非小改的 Implementation Plan 寫進 `.claude/plan.md`。
+2. Claude 想收工 → `plan-review.py` 掃 `.claude/plan.md` 結尾,**沒看到 `[REVIEW_PASSED_MARKER]` 就擋下**,注入提示詞逼它跑 `codex-review` skill。
+3. skill 用 `codex exec -s read-only`(Reviewer 只讀不改）送審,後續輪 `codex exec resume --last` 保留同一 session 上下文，來回辯駁。
+4. Codex 回 `VERDICT: APPROVED` → Claude 在 `.claude/plan.md` 末端蓋 `[REVIEW_PASSED_MARKER]` → hook 放行。
+
+需求:本機已安裝並登入 **Codex CLI**（`codex login`）。防無限迴圈同樣靠 `stop_hook_active`（每段工作只擋一次）。不需要計劃審查時,刪掉 `.claude/plan.md` 即解除此閘門。
+
+> Reviewer 方法論與循環邏輯定義在 `.claude/skills/codex-review/SKILL.md`,可自行調整嚴格度。
+
 ## 授權
 
 MIT
