@@ -10,7 +10,7 @@ description: 把當前 .claude/plan.md 送交 Codex 當無情 Reviewer 做跨模
 
 ## 前置
 - Reviewer 引擎:Codex CLI(`codex exec`,非互動;`-s read-only` 讓它只讀不改你的檔)。
-- Session 續接:第一輪用 `codex exec`,**後續輪一律 `codex exec resume --last`**,以保留上下文(這是「同一 session 收斂」的關鍵,避免每輪重新發明問題)。`resume` **不接受 `-s/--sandbox`**,它會繼承第一輪的 read-only 沙箱,後續輪勿再加 `-s`。
+- Session 續接(**精準 id,不要用 `--last`**):第一輪用 `codex exec` 建立 session,立刻擷取它的 **session id**,後續輪一律 `codex exec resume "<id>"`,以保留上下文(這是「同一 session 收斂」的關鍵,避免每輪重新發明問題)。用 `--last` 在多個 codex session 並行時會接錯;用 id 才安全。`resume` **不接受 `-s/--sandbox`**,它會繼承第一輪的 read-only 沙箱,後續輪勿再加 `-s`。
 - 擷取裁決:加 `-o <tmpfile>` 把 Codex 最終訊息寫進檔案再讀,別只靠 stdout 尾段。
 
 ## 第一輪:送審
@@ -44,12 +44,21 @@ PROMPT
 
 讀 `/tmp/codex_review.txt` 取得 Codex 回覆。
 
+接著**立刻擷取這個 session 的 id**(供後續輪精準 resume,取代易接錯的 `--last`)。Codex 把每個 session 持久化成 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`,第一行 `session_meta.payload.id` 即為 id:
+
+```bash
+SID=$(python3 -c "import json,glob,os; base=os.path.expanduser(os.environ.get('CODEX_HOME') or '~/.codex'); f=max(glob.glob(base+'/sessions/**/rollout-*.jsonl',recursive=True), key=os.path.getmtime); print(json.loads(open(f,encoding='utf-8').readline())['payload']['id'])")
+echo "$SID"   # 記下這個 id,本輪審查循環全程用它
+```
+
+> 擷取要緊接在第一輪之後、且這之前別開其他 codex session,以免 mtime 抓到別人的 session。萬一 id 抓失敗,退而用 `resume --last`(僅在沒有並行 session 時可靠)。
+
 ## 審查循環(收到回饋後)
 - **Codex 提出質疑** → 依「先思考再編碼」評估其合理性:
   - 合理 → 對 plan.md 做「精準外科手術式修改」(只動有漏洞處,其餘原樣),更新計劃;
   - 不合理 → 拿嚴謹技術理據反駁、說服它。
-  然後把「你的修改/反駁」用 `codex exec resume --last -o /tmp/codex_review.txt "<內容>"`
-  送回複查(resume 已繼承 read-only,勿加 -s)。**每一輪都要真的回到 Codex**,不可自行宣稱通過。
+  然後把「你的修改/反駁」用 `codex exec resume "$SID" -o /tmp/codex_review.txt "<內容>"`
+  送回複查(用第一輪擷取的精準 id;resume 已繼承 read-only,勿加 -s)。**每一輪都要真的回到 Codex**,不可自行宣稱通過。
 - **Codex 回覆含 `VERDICT: APPROVED`** → 審核正式通過。立即在 `.claude/plan.md`「最尾端」另起一行蓋章:
 
   ```
@@ -62,4 +71,4 @@ PROMPT
 - 不捏造審查結果:沒真的跑 `codex` 就不准蓋章;Codex 的原文裁決要可追溯(留在 /tmp/codex_review.txt)。
 - marker 只蓋在「真正取得 APPROVED」之後,且只蓋在檔案最尾端一行。
 - 若這次任務根本不需要計劃審查,正確解法是刪掉 `.claude/plan.md` 解除閘門,而不是偽造 marker。
-- `resume --last` 取的是「最近一個 Codex session」;審查循環請連續做完,中途不要另開無關的 codex session,以免 --last 接錯。
+- 全程用第一輪擷取的精準 `$SID` 做 resume,**不要用 `--last`**;這樣即使同時有多個 codex session 並行也不會接錯。
