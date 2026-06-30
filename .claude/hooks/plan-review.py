@@ -61,7 +61,7 @@ def main():
         "1. 讀取 .claude/plan.md(你目前規劃的 Implementation Plan)。\n"
         "2. 在「同一個 Codex session」中把實作計劃送交 Codex 審查:\n"
         "   - 第一輪:codex exec -s read-only -C \"<repo>\" -o <tmp> \"<reviewer 提示詞 + 計劃>\"\n"
-        "   - 後續輪:codex exec resume --last -s read-only -o <tmp> \"<你的修改/反駁>\"\n"
+        "   - 後續輪:codex exec resume --last -o <tmp> \"<你的修改/反駁>\"(resume 繼承原 session 的 read-only,勿再加 -s)\n"
         "3. 嚴格依審查方法論與 Codex 來回辯駁:該修的做精準外科手術式修改並更新 plan.md;\n"
         "   該駁的拿嚴謹技術理據反駁說服它。直到 Codex 回覆中出現 `VERDICT: APPROVED`。\n"
         "4. 取得 APPROVED 後,在 .claude/plan.md「最尾端」另起一行蓋上暗號:\n"

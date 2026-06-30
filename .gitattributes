@@ -1,0 +1,4 @@
+# 強制以 LF 結尾,避免 Windows autocrlf=true 的機器 clone 後 CRLF
+# 壞掉 shell 腳本(bad interpreter / \r)與 hook。
+*.sh   text eol=lf
+*.py   text eol=lf

@@ -10,7 +10,7 @@ description: 把當前 .claude/plan.md 送交 Codex 當無情 Reviewer 做跨模
 
 ## 前置
 - Reviewer 引擎:Codex CLI(`codex exec`,非互動;`-s read-only` 讓它只讀不改你的檔)。
-- Session 續接:第一輪用 `codex exec`,**後續輪一律 `codex exec resume --last`**,以保留上下文(這是「同一 session 收斂」的關鍵,避免每輪重新發明問題)。
+- Session 續接:第一輪用 `codex exec`,**後續輪一律 `codex exec resume --last`**,以保留上下文(這是「同一 session 收斂」的關鍵,避免每輪重新發明問題)。`resume` **不接受 `-s/--sandbox`**,它會繼承第一輪的 read-only 沙箱,後續輪勿再加 `-s`。
 - 擷取裁決:加 `-o <tmpfile>` 把 Codex 最終訊息寫進檔案再讀,別只靠 stdout 尾段。
 
 ## 第一輪:送審
@@ -48,8 +48,8 @@ PROMPT
 - **Codex 提出質疑** → 依「先思考再編碼」評估其合理性:
   - 合理 → 對 plan.md 做「精準外科手術式修改」(只動有漏洞處,其餘原樣),更新計劃;
   - 不合理 → 拿嚴謹技術理據反駁、說服它。
-  然後把「你的修改/反駁」用 `codex exec resume --last -s read-only -o /tmp/codex_review.txt "<內容>"`
-  送回複查。**每一輪都要真的回到 Codex**,不可自行宣稱通過。
+  然後把「你的修改/反駁」用 `codex exec resume --last -o /tmp/codex_review.txt "<內容>"`
+  送回複查(resume 已繼承 read-only,勿加 -s)。**每一輪都要真的回到 Codex**,不可自行宣稱通過。
 - **Codex 回覆含 `VERDICT: APPROVED`** → 審核正式通過。立即在 `.claude/plan.md`「最尾端」另起一行蓋章:
 
   ```
