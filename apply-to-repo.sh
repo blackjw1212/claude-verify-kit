@@ -27,16 +27,20 @@ apply_one() {
   cp "$SRC/.claude/settings.json"      ./.claude/settings.json
   cp "$SRC/.claude/hooks/verify.py"     ./.claude/hooks/verify.py
   cp "$SRC/.claude/hooks/plan-review.py" ./.claude/hooks/plan-review.py
+  cp "$SRC/.claude/hooks/loop-gate.py"   ./.claude/hooks/loop-gate.py
+  cp "$SRC/.claude/loop.example.json"    ./.claude/loop.example.json
   cp "$SRC/.claude/skills/codex-review/SKILL.md" ./.claude/skills/codex-review/SKILL.md
-  chmod +x .claude/hooks/verify.py .claude/hooks/plan-review.py 2>/dev/null || true
+  chmod +x .claude/hooks/verify.py .claude/hooks/plan-review.py .claude/hooks/loop-gate.py 2>/dev/null || true
 
   touch .gitignore
-  for line in ".claude/.last_verify_ok" ".claude/skip-verify" ".claude/plan.md"; do
+  for line in ".claude/.last_verify_ok" ".claude/skip-verify" ".claude/plan.md" \
+              ".claude/loop.json" ".claude/.loop_state.json"; do
     grep -qxF "$line" .gitignore || echo "$line" >> .gitignore
   done
 
   git add CLAUDE.md .claude/settings.json .claude/hooks/verify.py \
-          .claude/hooks/plan-review.py .claude/skills/codex-review/SKILL.md .gitignore
+          .claude/hooks/plan-review.py .claude/hooks/loop-gate.py \
+          .claude/loop.example.json .claude/skills/codex-review/SKILL.md .gitignore
   if git diff --cached --quiet; then echo "ℹ️  無變更,略過。"; return; fi
   git commit -m "chore(claude): add Stop-hook verifier + CLAUDE.md working contract"
   echo "✅ 已 commit(本機)。"

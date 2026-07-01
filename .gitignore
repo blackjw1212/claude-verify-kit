@@ -2,6 +2,8 @@
 .claude/.last_verify_ok
 .claude/skip-verify
 .claude/plan.md
+.claude/loop.json
+.claude/.loop_state.json
 
 # OS / 編輯器雜物
 .DS_Store

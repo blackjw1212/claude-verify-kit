@@ -24,6 +24,13 @@ import os
 import sys
 from pathlib import Path
 
+# Windows 主控台 Python 的 stdout 預設 cp950(Big5),Claude Code 以 UTF-8 讀 hook 輸出;
+# 不強制 UTF-8 中文 reason 會變亂碼(甚至遇非 Big5 字元崩潰)。
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 MARKER = "[REVIEW_PASSED_MARKER]"
 
 

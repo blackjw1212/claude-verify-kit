@@ -10,8 +10,10 @@ mkdir -p "$DEST/hooks" "$DEST/skills/codex-review"
 cp "$SRC/CLAUDE.md"                    "$DEST/CLAUDE.md"
 cp "$SRC/.claude/hooks/verify.py"      "$DEST/hooks/verify.py"
 cp "$SRC/.claude/hooks/plan-review.py" "$DEST/hooks/plan-review.py"
+cp "$SRC/.claude/hooks/loop-gate.py"   "$DEST/hooks/loop-gate.py"
+cp "$SRC/.claude/loop.example.json"    "$DEST/loop.example.json"
 cp "$SRC/.claude/skills/codex-review/SKILL.md" "$DEST/skills/codex-review/SKILL.md"
-chmod +x "$DEST/hooks/verify.py" "$DEST/hooks/plan-review.py"
+chmod +x "$DEST/hooks/verify.py" "$DEST/hooks/plan-review.py" "$DEST/hooks/loop-gate.py"
 
 # 全域 settings.json:hook 指向 ~/.claude/hooks/verify.py
 # 若已存在則備份,避免覆蓋你既有設定。
@@ -25,6 +27,11 @@ cat > "$DEST/settings.json" <<'JSON'
     "Stop": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/loop-gate.py",
+            "timeout": 600
+          },
           {
             "type": "command",
             "command": "python3 ~/.claude/hooks/plan-review.py",
