@@ -57,7 +57,7 @@ PY
 
   touch .gitignore
   for line in ".claude/.last_verify_ok" ".claude/skip-verify" ".claude/plan.md" \
-              ".claude/loop.json" ".claude/.loop_state.json" ".claude/settings.json.bak.*"; do
+              ".claude/loop.json" ".claude/.loop_state.json" ".claude/settings.json.bak.*" ".claude/hooks/__pycache__/"; do
     grep -qxF "$line" .gitignore || echo "$line" >> .gitignore
   done
 
