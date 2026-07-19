@@ -61,9 +61,17 @@ PY
     grep -qxF "$line" .gitignore || echo "$line" >> .gitignore
   done
 
+  # 鎖 hooks 行尾為 LF:否則 clone/rebase 重新 checkout 時 autocrlf 會轉成 CRLF,
+  # 造成各 repo 的 hook 內容雜湊不一致。範圍限定 .claude/hooks/ —— 不可用 *.py,
+  # 那會連專案自己的 Python 原始碼一起重正規化,產生大規模無關 diff。
+  touch .gitattributes
+  grep -qxF ".claude/hooks/*.py text eol=lf" .gitattributes || \
+    echo ".claude/hooks/*.py text eol=lf" >> .gitattributes
+
   git add .claude/settings.json .claude/hooks/verify.py \
           .claude/hooks/plan-review.py .claude/hooks/loop-gate.py \
-          .claude/loop.example.json .claude/skills/codex-review/SKILL.md .gitignore
+          .claude/loop.example.json .claude/skills/codex-review/SKILL.md \
+          .gitignore .gitattributes
   if [ -n "$ADD_CONTRACT" ]; then git add CLAUDE.md; fi
   if git diff --cached --quiet; then echo "ℹ️  無變更,略過。"; return; fi
   git commit -m "chore(claude): add Stop-hook verifier + CLAUDE.md working contract"
