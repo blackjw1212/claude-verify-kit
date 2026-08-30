@@ -38,6 +38,22 @@
 
 > Windows：把 `settings.json` 與安裝腳本中的 `python3` 改成 `python`。
 
+### C. 全機掃描（新專案漏套、kit 更新後 repo 沒跟上，都靠這支）
+
+```bash
+./scan-and-apply.sh                 # 只掃描回報，不動任何東西（預設）
+./scan-and-apply.sh --apply         # 套用 + commit
+./scan-and-apply.sh --apply --push  # 套用 + commit + push
+./scan-and-apply.sh --root ~/work   # 自訂掃描根目錄（可重複）
+```
+
+掃出所有 git repo 並分類 **NO_KIT**（沒套）/ **STALE**（hooks 版本落後 kit）/ **CURRENT**（略過），
+套用後自動驗收:hooks 同版、可編譯、`settings.json` 沒被 gitignore 誤擋。
+
+> 為什麼需要:新 repo 不會自己套，kit 修完 bug 各 repo 也不會自己更新。
+> 實際發生過:兩個新專案完全沒套，且兩個 repo 的閘門因 kit bug 長期假綠。
+> **建議固定週期跑一次 dry-run。**
+
 ## 自訂驗證標準（不被內建項目侷限）
 
 任一專案放 `.claude/verify`（`.sh` / `.py` / 可執行檔），閘門就**只認它的 exit code**，內建項目全部讓位。適合把專屬成功標準寫死，例如：
