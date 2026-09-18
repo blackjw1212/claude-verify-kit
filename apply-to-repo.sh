@@ -79,7 +79,9 @@ PY
 
   if [ "$DO_PUSH" = "1" ]; then
     echo "⤴️  push 中…"
-    if git push; then echo "✅ push 完成:$repo"
+    # 用 origin HEAD 而非裸 git push:分支若沒設 upstream,裸 push 會
+    # 直接 fatal(no upstream branch),即使遠端與認證都正常。
+    if git push origin HEAD; then echo "✅ push 完成:$repo"
     else echo "❌ push 失敗:$repo(commit 已在本機;檢查遠端/認證後重跑 git push)"; fi
   else
     echo "ℹ️  未 push。要推請加 --push,或自行 git push。"
