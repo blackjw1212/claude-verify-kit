@@ -11,6 +11,7 @@
 #   ./scan-and-apply.sh --root ~/work   # 自訂掃描根目錄(可重複)
 #
 # 分類:
+#   EMPTY    零 commit(別的工具剛建/clone 中)→ 只回報,絕不套用
 #   NO_KIT   完全沒套 → 會跑 apply-to-repo.sh
 #   STALE    有套但 hooks 版本與 kit 不同 → 會更新
 #   CURRENT  三支 hook 都與 kit 同版 → 略過
@@ -62,8 +63,15 @@ fi
 # ── 2. 分類 ────────────────────────────────────────────────────────────────
 md5of() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
-classify() {  # $1=repo 路徑 → 印 NO_KIT / STALE / CURRENT
+# 顯示用路徑:家目錄換成 ~。不可只印 basename —— 同名 repo(例:同一專案在
+# 兩處各有一份)會無法分辨,曾差點把「另一份空殼」誤診成「主 repo 的閘門被拆」。
+show() { local p="$1"; echo "${p/#$HOME/\~}"; }
+
+classify() {  # $1=repo 路徑 → 印 EMPTY / NO_KIT / STALE / CURRENT
   local r="$1"
+  # 零 commit 的 repo 不套:多半是別的工具(ChatGPT/Codex 等)剛建的工作區或 clone 進行中,
+  # 在裡面建第一個 commit 會污染它。
+  git -C "$r" rev-parse --verify -q HEAD >/dev/null 2>&1 || { echo EMPTY; return; }
   [ -f "$r/.claude/hooks/plan-review.py" ] || { echo NO_KIT; return; }
   local same=0
   for h in verify plan-review loop-gate; do
@@ -78,7 +86,8 @@ for r in "${repos[@]}"; do
   st="$(classify "$r")"
   case "$st" in
     CURRENT) n_cur=$((n_cur+1)) ;;
-    *) todo+=("$r"); printf '  %-8s %s\n' "$st" "$(basename "$r")" ;;
+    EMPTY)   printf '  %-8s %s(零 commit,略過不套)\n' "$st" "$(show "$r")" ;;
+    *) todo+=("$r"); printf '  %-8s %s\n' "$st" "$(show "$r")" ;;
   esac
 done
 echo "  CURRENT  $n_cur 個(已是最新,略過)"
@@ -106,7 +115,7 @@ echo
 echo "── 驗收 ──"
 fail=0
 for r in "${todo[@]}"; do
-  n="$(basename "$r")"
+  n="$(show "$r")"
   cd "$r" || continue
 
   bad=""
