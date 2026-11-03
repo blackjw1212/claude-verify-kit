@@ -255,3 +255,17 @@ def test_summary_of_node_test_tap_output(hook, tmp_path):
     ]
     assert lines[4] == "    check (backend/test/schema.test.js:19:10)"
     assert not any("讀取設定失敗" in ln for ln in lines)
+
+
+def test_timeout_in_builtin_check_is_never_recorded_as_success(project):
+    # 自訂驗證(override)路徑本來就不寫「上次全綠」,所以上面那條測不到內建檢查的路徑;
+    # 反向測試(M10)抓出這個缺口後補上這條。
+    write(project, "tests/test_slow.py", "import time\n\ndef test_slow():\n    time.sleep(20)\n")
+    configure(project, on_timeout="warn", validators={"pytest": {"timeout": 1}})
+    r1 = run_hook(project)
+    assert not r1.blocked and "逾時" in r1.system, r1
+    state = json.loads((project / ".claude/.verify_state.json").read_text(encoding="utf-8"))
+    assert "ok_fp" not in state
+    assert [x["status"] for x in read_log(project)[-1]["results"] if x["id"] == "pytest"] == ["timeout"]
+    run_hook(project)                              # 沒有任何變更也必須重跑
+    assert len(read_log(project)) == 2
