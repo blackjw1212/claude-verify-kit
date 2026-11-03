@@ -1,6 +1,7 @@
 # 跨平台測試:Ubuntu / Windows / macOS × Python 3.8 / 3.11 / 3.12 / 3.13。
 # fail-fast 關掉:一格紅了其他格照跑,才看得出是「某平台的問題」還是「全部都壞」。
-# 每格都上傳 JUnit XML,被跳過的測試與原因(-rs)也印在日誌裡 —— 跳過不等於通過。
+# 每格都上傳 JUnit XML,並把通過/失敗/跳過(含跳過原因)寫進該格的 job 摘要;最後的 summary job
+# 把 12 格合成一張表(artifact: cross-platform-summary)。跳過不等於通過,兩者分開計。
 name: tests
 
 on:
@@ -26,7 +27,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -m pip install vermin==1.6.0
-      - run: vermin -t=3.8- --no-tips --violations --eval-annotations .claude/hooks/verify.py tests bench
+      - run: vermin -t=3.8- --no-tips --violations --eval-annotations .claude/hooks/verify.py tests bench .github/scripts
 
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}
@@ -56,9 +57,34 @@ jobs:
         run: >
           python -m pytest tests -rs -p no:cacheprovider
           --junitxml "junit-${{ matrix.os }}-py${{ matrix.python }}.xml"
+      - name: 結果摘要(通過 / 失敗 / 跳過與原因)
+        if: always()
+        run: python .github/scripts/junit_summary.py cell "junit-${{ matrix.os }}-py${{ matrix.python }}.xml" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: junit-${{ matrix.os }}-py${{ matrix.python }}
           path: junit-*.xml
           if-no-files-found: error
+
+  summary:
+    # 12 格合成一張表。test 有任何一格失敗也照跑(if: always()),這樣才看得到是哪一格
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: junit-*
+          path: junit
+          merge-multiple: true
+      - name: 跨平台矩陣摘要
+        run: |
+          python3 .github/scripts/junit_summary.py matrix junit > cross-platform-summary.md
+          cat cross-platform-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: cross-platform-summary
+          path: cross-platform-summary.md
