@@ -304,7 +304,8 @@ def test_dynamic_build_inputs_fall_back_to_any_change(project, fake, setup):
     write(project, "data/config.json", '{"v": 2}')
     run_hook(project, env=fake.env)
     assert fake.runs("pio") + fake.runs("idf.py") == 2
-    assert plan_of(project, "firmware")["why"].find("any:") >= 0
+    why = plan_of(project, "firmware")["why"]
+    assert "any:" in why or "always:" in why   # 深度驗收後:任意程式 / 未知變數 → always(更嚴格)
 
 
 # ---------------------------------------------------------------- 測試類:任何變更都重跑,沒變更才沿用
@@ -342,6 +343,7 @@ def test_failing_tests_rerun_even_without_changes(project, fake, tmp_path):
 def test_override_cached_when_unchanged_and_rerun_on_change(project, fake, tmp_path):
     counter = tmp_path / "counter"
     write(project, ".claude/verify.sh", f'printf x >> "{counter}"\n')
+    configure(project, override_cache=True)   # 深度驗收後預設改為 false(自訂腳本的相依無從得知)
     write(project, "a.txt", "1")
     run_hook(project, env=fake.env)
     run_hook(project, env=fake.env)

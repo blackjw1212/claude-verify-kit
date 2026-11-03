@@ -85,21 +85,45 @@ Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":
 
 ## 只驗變更的部分、快取、平行
 
-- **變更怎麼判定**：比對檔案內容雜湊（存在 `.claude/.verify_cache.json`），不是 transcript 也不是 git。transcript 看不到 Bash 改的檔（`sed -i`、腳本、`git checkout`），官方文件也說它在 Stop 當下可能還沒寫完；git status 列的是所有未 commit 的變更而非這一輪的，也看不到被 `.gitignore` 排除、但驗證器照樣會檢查的檔案。只 `touch`、內容沒變不算變更。
-- **逐檔驗證器**（JSON、XML、plist、ACPI、xlsx、shellcheck、Python 語法）：只驗內容變了的檔案，其餘沿用上次的結果——**包括上次的失敗**，沒修好的檔照樣擋。快取鍵 = 檔案內容雜湊 + 驗證器版本 + 工具識別（路徑、大小、mtime；shellcheck 另含 `.shellcheckrc`）。
-- **專案層級驗證器**（建置、測試、自訂驗證）：它的輸入變了才重跑，**只快取通過**（失敗可能是環境問題，裝好套件後檔案沒變也必須重跑）。
-  - 韌體：原始碼、標頭、建置設定、`EMBED_FILES`／`board_build.embed_*` 宣告的檔案。遇到 `file(GLOB)`、`configure_file`、PlatformIO `extra_scripts`、含變數的嵌入路徑等看不出輸入的寫法，就改成任何變更都重建；任何檔案被刪除也重建。
-  - pytest、npm、cargo、aglint、`.claude/verify*`：任何檔案變更都重跑（它們可能讀任何檔案）。
-- **平行**：彼此獨立的驗證器同時跑，最多 `max_parallel` 個（預設 min(4, CPU 數)），其中重型（韌體、測試、Node、Rust、自訂驗證）最多 `max_heavy` 個（預設 1），避免韌體建置吃滿 CPU。`max_parallel: 1` = 完全依序。
-- **已知限制**：內容改了、但大小與 mtime 都被刻意還原成很久以前的時間（例如 `cp -p` 一個同大小的舊檔），預設模式看不到（與 git index 相同）。要嚴格請設 `"trust_mtime": false`（每次重讀全部檔案）。工具以外的環境變化（例如 `pip install` 進全域 Python）不在快取鍵裡；venv 的 site-packages、`node_modules`、`.pio/libdeps`、`managed_components` 的異動有算進去。
-- **相關設定**（`.claude/verify.json`）：`max_parallel`、`max_heavy`、`cache`（false = 每次全驗）、`override_cache`（false = 自訂驗證每次都跑，即 Stage 1 行為）、`trust_mtime`、`debug`（或環境變數 `CLAUDE_VERIFY_DEBUG=1`：把每個驗證器為什麼跑、為什麼沿用寫進 `.claude/.verify.log`）。
-- **效能**：`python3 bench/benchmark.py` 量三種情境（無變更／只改一個 JSON／改韌體原始碼），見下表（合成專案 719 個檔案，韌體建置以固定 3 秒的假 `pio` 代替，CPU 4 核）：
+原則：**寧可多花幾秒重新驗證，也不能因為快取把失敗的專案判定為通過。**快取只在「檔案內容」和「環境」都沒變時才沿用；任何一項追不到，就當成變了。
 
-| 情境 | 原版 bf696de | Stage 1 | Stage 2 |
-|---|---|---|---|
-| 無變更 | 0.05 s | 0.06 s | 0.07 s |
-| 只改一個 JSON | 7.43 s | 3.85 s | 0.70 s |
-| 改韌體原始碼 | 7.34 s | 3.90 s | 3.81 s |
+- **變更怎麼判定**：比對檔案內容雜湊（`.claude/.verify_cache.json`），不是 transcript 也不是 git。transcript 看不到 Bash 改的檔，官方文件也說它在 Stop 當下可能還沒寫完；git status 列的是所有未 commit 的變更，也看不到被 `.gitignore` 排除、但驗證器照樣會檢查的檔案。只 `touch`、內容沒變不算變更。
+- **環境也算變更**（全綠快速路徑與防迴圈都看它）：
+  - 工具執行檔本身（實際路徑、大小、mtime；symlink 換目標也算）。
+  - 被 `SKIP_DIRS` 排除的相依目錄：`node_modules`、`managed_components`、`.pio/libdeps`、專案直譯器的所有 site-packages（含 venv 與使用者 site），逐檔比對大小與 mtime，就地改套件也抓得到。
+  - 工具鏈：PlatformIO 的 `packages/`、`platforms/`（`PLATFORMIO_CORE_DIR`）、ESP-IDF 的 `IDF_PATH`、版本檔、PATH 上的 xtensa/riscv 編譯器、`IDF_TOOLS_PATH`、rustup（`RUSTUP_TOOLCHAIN`、`settings.toml`、toolchains）、Arduino 核心與 sketchbook 函式庫。
+  - 相關環境變數（`IDF_*`、`PLATFORMIO_*`、`PYTHONPATH`、`NODE_OPTIONS`…），以及 `.claude/verify.json` 的設定雜湊（設定改了，所有快取作廢）。
+  - 相依目錄超過 `dep_scan_cap`（預設 30 萬個檔）、或問不到直譯器的套件目錄 → 那個驗證器每次都跑。
+- **逐檔驗證器**（JSON、XML、plist、ACPI、xlsx、shellcheck、Python 語法）：只驗內容變了的檔案，其餘沿用上次的結果，**包括上次的失敗**。
+- **專案層級驗證器**：只快取通過。追蹤分三種模式：
+  - `precise`：韌體的原始碼、標頭、建置設定、宣告嵌入的檔案、被 `include()` 的專案內 `.cmake`。
+  - `any`：任何專案檔案變更都重跑。適用 pytest、npm、cargo、aglint，以及用了 `file(GLOB)`、`configure_file` 的韌體專案。
+  - `always`：每次都跑，也不走全綠快速路徑。適用三種情況：建置會執行任意程式（`execute_process`、`add_custom_command`、FetchContent、PlatformIO `extra_scripts`）；引用專案外的路徑（`include()`、`EXTRA_COMPONENT_DIRS`、`add_subdirectory`、`lib_extra_dirs`、`-I`、`lib_deps = file://`、嵌入檔）；或路徑含無法解析的變數。`${CMAKE_CURRENT_SOURCE_DIR}` 等已知變數，以及同檔 `set()` 的字面值，會先代換。
+  - 任何檔案被刪除時，`precise` 模式也重建。
+- **自訂驗證 `.claude/verify*`**：預設每次都跑（`override_cache: false`），因為它讀什麼、依賴什麼無從得知。設成 `true` 會把常見工具、PATH、相依目錄與工具鏈都算進環境，沒變就不重跑。
+- **快取本身的安全**：快取檔有校驗碼，並記錄所在目錄、格式版本、kit 版本、設定雜湊。任一項不符（截斷、寫壞、欄位型別錯、手改、從別的目錄複製來）→ 整份作廢、完整驗證。全綠紀錄和快取存在同一個檔、同一次原子寫入，所以刪掉或寫壞快取，就不會走快速路徑。狀態檔的欄位型別也會檢查。hook 若仍在第一次執行時崩潰，會改用「不含快取」的完整驗證重試；兩次都失敗才放行，而且使用者看得到。**限制**：校驗碼擋不住「改完連校驗碼一起重算」的刻意竄改，因為 hook 與被它管的程序權限相同。
+- **並行與終止**：多個 hook 同時跑時，快取用原子替換寫入；結果以內容雜湊為鍵，舊的寫入不會套到不同的內容上。hook 被 SIGTERM／SIGINT 終止時，會先收掉整棵子程序樹；SIGKILL 攔不到，子程序會留著，但快取不會被寫入。
+- **平行**：彼此獨立的驗證器同時跑，最多 `max_parallel` 個，其中重型最多 `max_heavy` 個（預設 1）。
+- **已知限制**：內容改了，但大小與 mtime 都被刻意還原成很久以前，預設模式看不到（與 git index 相同）；要嚴格請設 `"trust_mtime": false`。工具鏈與相依目錄是用「目錄清單＋關鍵檔的大小／mtime」或「逐檔大小／mtime」追蹤，沒有讀內容。
+- **相關設定**（`.claude/verify.json`）：`max_parallel`、`max_heavy`、`cache`、`override_cache`、`trust_mtime`、`dep_scan_cap`、`debug`（或環境變數 `CLAUDE_VERIFY_DEBUG=1`）。
+- **效能**：`python3 bench/benchmark.py`，結果見下表。
+
+合成專案 719 個檔案，CPU 4 核，每格為中位數，單位秒。韌體建置用固定 3 秒的假 `pio`；「未重建」表示那一次根本沒有呼叫建置工具。
+
+| 情境 | 原版 bf696de | Stage 1 | Stage 2 初版 c202ef0 | Stage 2 驗收後 |
+|---|---|---|---|---|
+| 無變更 | 0.07 | 0.07 | 0.08 | 0.15 |
+| 只改一個 JSON | 7.58 | 3.97 | 0.91 | 0.88 |
+| 改一個 Python 原始碼 | 7.63 | 3.97 | 0.90 | 0.93 |
+| 改韌體原始碼 | 7.45 | 4.11 | 3.91 | 3.92 |
+| 工具版本變更（只換 pio） | 0.05 **未重建** | 0.07 **未重建** | 0.09 **未重建** | 3.20 重建 |
+| 刪掉快取（完整重驗） | 7.88 | 4.00 | 3.96 | 3.96 |
+| 冷啟動 | 7.92 | 4.07 | 3.85 | 3.99 |
+
+大型專案（約 1 萬個專案檔＋4 萬個 `node_modules` 檔）：無變更 0.68 s（初版 0.22 s，多出來的是逐檔掃描 `node_modules`），只改一個 JSON 2.30 s（原版 30.0 s）。
+
+自訂驗證（`.claude/verify.sh`）的實際專案：`override_cache: false`（預設）每次約 16.5 s；設成 `true`，無變更時約 0.13 s。
+
 
 ## Cross-Model 計劃審查（Claude ↔ Codex）
 

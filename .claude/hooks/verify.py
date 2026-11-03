@@ -25,6 +25,18 @@ AdGuard、xlsx、shell、Python、Node、Rust)。
       測試、Node、Rust、aglint、自訂驗證  任何檔案變更都重跑(它們可能讀任何檔)
   - 彼此獨立的驗證器平行執行:最多 max_parallel 個,其中重型最多 max_heavy 個。
 
+Stage 2 深度驗收(2026-11-03)加上的保護 —— 原則:寧可多驗,不可因快取放行:
+  - 全綠快速路徑與防迴圈的指紋 = 檔案內容 + 環境(工具執行檔、node_modules /
+    managed_components / .pio/libdeps / site-packages 逐檔簽章、PlatformIO / ESP-IDF /
+    rustup / Arduino 工具鏈、系統編譯器、相關環境變數、設定雜湊)。環境變了就重驗。
+  - 追不到的(相依目錄太大、專案外的路徑、任意程式 extra_scripts / execute_process、
+    無法解析的變數)→ always:每次都跑,不走快速路徑。
+  - 快取有校驗碼、記錄所在目錄與設定雜湊,結構逐欄檢查;任何不符 → 整份作廢、完整驗證。
+    全綠紀錄存在快取檔裡,刪掉或寫壞快取就不會走快速路徑。
+  - 第一次執行崩潰 → 不用快取與狀態檔、完整驗證重試;兩次都失敗才放行(使用者看得到)。
+  - SIGTERM / SIGINT 時先收掉整棵子程序樹。
+  - 自訂驗證預設每次都跑(override_cache=false)。
+
 每個結果是四種狀態之一,處置不同(.claude/verify.json 可調):
   fail     真正的驗證失敗           → 擋下
   missing  工具不存在               → 預設只警告(on_missing: warn|block|ignore)
@@ -58,6 +70,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import xml.parsers.expat
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -114,9 +127,10 @@ DEFAULT_CONFIG = {
     "max_parallel": min(4, os.cpu_count() or 1),  # 同時跑幾個驗證器;1 = 完全依序
     "max_heavy": 1,                 # 其中重型(韌體建置、測試)最多幾個
     "cache": True,                  # False = 每次都驗全部(不沿用快取結果)
-    "override_cache": True,         # False = 自訂驗證每次都跑(Stage 1 行為)
+    "override_cache": False,        # True = 檔案與環境都沒變時不重跑自訂驗證(它讀什麼無從得知,預設不快取)
     "trust_mtime": True,            # False = 每次重新雜湊所有檔案(最慢、最保守)
     "debug": False,                 # 或環境變數 CLAUDE_VERIFY_DEBUG=1:把跳過/沿用的理由寫進紀錄
+    "dep_scan_cap": 300000,         # 相依目錄(node_modules…)逐檔掃描的上限;超過 → 該驗證器每次都跑
     "validators": {},               # {"<id>": {"timeout": 秒, "on_missing": ..., "on_timeout": ...}}
 }
 
@@ -244,7 +258,8 @@ def load_config(project, notes):
             val = clean
         else:  # 數值
             minimum = {"max_lines": 1, "max_reason_chars": 500, "budget_seconds": 1,
-                       "max_consecutive_blocks": 0, "max_parallel": 1, "max_heavy": 1}[key]
+                       "max_consecutive_blocks": 0, "max_parallel": 1, "max_heavy": 1,
+                       "dep_scan_cap": 1}[key]
             if isinstance(val, bool) or not isinstance(val, (int, float)) or val < minimum:
                 bad(key, f"必須是 ≥ {minimum} 的數字")
                 continue
@@ -338,6 +353,32 @@ def _kill_tree(proc):
         pass
 
 
+# 正在跑的子程序。hook 自己被 SIGTERM/SIGINT 終止時(例如 Claude Code 的 hook 逾時),
+# 先把它們整棵收掉再離開 —— 子程序在獨立的 process group 裡,否則會變成孤兒繼續建置。
+# SIGKILL 攔不到:那種情況子程序會留著(已知限制),但快取不會被寫入,不會變成錯誤的通過。
+_ACTIVE = set()
+_ACTIVE_LOCK = threading.RLock()
+
+
+def _terminate_children(signum, _frame):
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE)
+    for proc in procs:
+        _kill_tree(proc)
+    os._exit(128 + int(signum))
+
+
+def install_signal_handlers():
+    for name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _terminate_children)
+        except (ValueError, OSError):
+            pass
+
+
 def _read_capped(fh, head=64 * 1024, tail=512 * 1024):
     fh.seek(0, os.SEEK_END)
     size = fh.tell()
@@ -373,6 +414,8 @@ def run_tool(argv, cwd, timeout, env=None, stdin_bytes=None):
     t0 = time.monotonic()
     try:
         proc = subprocess.Popen(spawn, **kwargs)
+        with _ACTIVE_LOCK:
+            _ACTIVE.add(proc)
     except FileNotFoundError:
         out.close()
         return "missing", None, f"找不到 {argv[0]}", 0.0
@@ -385,6 +428,9 @@ def run_tool(argv, cwd, timeout, env=None, stdin_bytes=None):
     except subprocess.TimeoutExpired:
         _kill_tree(proc)
         rc, status = None, "timeout"
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE.discard(proc)
     dur = time.monotonic() - t0
     try:
         text = decode_output(_read_capped(out))
@@ -559,8 +605,13 @@ class Ctx:
     #      鑽進 node_modules 才被過濾掉)
     def files(self):
         if self._files is None:
-            self._files = walk_files(self.project)
+            self._found = {}
+            self._files = walk_files(self.project, self._found)
         return self._files
+
+    def dep_dirs(self, name):
+        self.files()
+        return sorted(self._found.get(name, []))
 
     def reset_files(self):
         self._files = None
@@ -618,11 +669,16 @@ class Ctx:
         return r
 
 
-def walk_files(project):
-    """回傳專案內所有檔案的相對路徑(POSIX 分隔),剪掉 SKIP_DIRS。"""
+def walk_files(project, found=None):
+    """回傳專案內所有檔案的相對路徑(POSIX 分隔),剪掉 SKIP_DIRS。
+    found 不是 None 時,順便記下被剪掉的相依目錄(node_modules、managed_components)。"""
     out = []
     root = str(project)
     for dirpath, dirs, files in os.walk(root):
+        if found is not None:
+            for d in dirs:
+                if d in DEP_DIR_NAMES:
+                    found.setdefault(d, []).append(Path(dirpath) / d)
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         rel_dir = os.path.relpath(dirpath, root)
         prefix = "" if rel_dir == "." else rel_dir.replace(os.sep, "/") + "/"
@@ -755,47 +811,150 @@ def fingerprint(manifest):
     return manifest.digest()
 
 
-def load_cache(project):
-    empty = {"manifest": {}, "results": {}}
+def config_hash(cfg):
+    """設定改了 → 所有快取鍵都變(保守:不去判斷哪個設定會影響哪個驗證器)。debug 開關除外。"""
+    payload = {k: v for k, v in cfg.items() if k != "debug"}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+                          .encode("utf-8")).hexdigest()[:32]
+
+
+CACHE_FIELDS = ("format", "kit", "root", "config", "manifest", "results", "ok_fp")
+
+
+def _checksum(payload):
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+                          .encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def _is_int(x):
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _valid_manifest(m):
+    if not isinstance(m, dict):
+        return False
+    for k, v in m.items():
+        if not (isinstance(k, str) and isinstance(v, list) and len(v) == 4
+                and _is_int(v[0]) and _is_int(v[1]) and _is_int(v[2]) and isinstance(v[3], str)):
+            return False
+    return True
+
+
+def _valid_results(r):
+    if not isinstance(r, dict):
+        return False
+    for vid, ent in r.items():
+        if vid not in VALIDATOR_VERSIONS or not isinstance(ent, dict):
+            return False
+        if vid in FILE_VALIDATORS:
+            files = ent.get("files")
+            if not isinstance(ent.get("tool"), str) or not isinstance(files, dict):
+                return False
+            for rel, v in files.items():
+                if not (isinstance(rel, str) and isinstance(v, list) and len(v) == 3
+                        and isinstance(v[0], str) and v[1] in ("pass", "fail")
+                        and isinstance(v[2], list) and all(isinstance(x, str) for x in v[2])):
+                    return False
+        elif not (isinstance(ent.get("key"), str) and ent.get("status") == "pass"):
+            return False
+    return True
+
+
+def _empty_cache(status):
+    return {"manifest": {}, "results": {}, "ok_fp": None, "status": status}
+
+
+def load_cache(project, chash=None):
+    """讀快取。任何不對勁都回空快取(= 這次完整驗證),並在 status 說明原因:
+      missing / unreadable / not-object / format / checksum / root / schema —— 全部作廢
+      kit-or-config —— 檔案雜湊仍可沿用(只跟內容有關),驗證結果與全綠紀錄作廢
+    校驗碼擋得住截斷、寫壞、手動改值;擋不住「改完連校驗碼一起重算」的刻意竄改
+    (hook 與被它管的程序權限相同,這一點做不到)。"""
+    path = project / ".claude" / CACHE_NAME
+    if not path.exists():
+        return _empty_cache("missing")
     try:
-        c = json.loads((project / ".claude" / CACHE_NAME).read_text(encoding="utf-8"))
+        c = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return empty
-    if not isinstance(c, dict) or c.get("format") != CACHE_FORMAT:
-        return empty
-    man = c.get("manifest") if isinstance(c.get("manifest"), dict) else {}
-    # kit 版本變了 → 驗證結果全部作廢(判定邏輯可能不同);檔案雜湊仍可沿用。
-    res = c.get("results") if c.get("kit") == VERSION and isinstance(c.get("results"), dict) else {}
-    return {"manifest": man, "results": res}
+        return _empty_cache("unreadable")
+    if not isinstance(c, dict):
+        return _empty_cache("not-object")
+    if c.get("format") != CACHE_FORMAT:
+        return _empty_cache("format")
+    if c.get("checksum") != _checksum({k: c.get(k) for k in CACHE_FIELDS}):
+        return _empty_cache("checksum")
+    if c.get("root") != str(project):
+        return _empty_cache("root")
+    ok_fp = c.get("ok_fp")
+    if not (_valid_manifest(c.get("manifest")) and _valid_results(c.get("results"))
+            and (ok_fp is None or isinstance(ok_fp, str))):
+        return _empty_cache("schema")
+    if c.get("kit") != VERSION or c.get("config") != chash:
+        return {"manifest": c["manifest"], "results": {}, "ok_fp": None, "status": "kit-or-config"}
+    return {"manifest": c["manifest"], "results": c["results"], "ok_fp": ok_fp, "status": "ok"}
 
 
-def save_cache(project, manifest, results):
+def save_cache(project, manifest, results, ok_fp=None, chash=None):
+    payload = {"format": CACHE_FORMAT, "kit": VERSION, "root": str(project), "config": chash,
+               "manifest": manifest.entries, "results": results, "ok_fp": ok_fp}
+    data = dict(payload)
+    data["checksum"] = _checksum(payload)
     path = project / ".claude" / CACHE_NAME
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"format": CACHE_FORMAT, "kit": VERSION,
-                                   "manifest": manifest.entries, "results": results},
-                                  ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        os.replace(str(tmp), str(path))
+        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        os.replace(str(tmp), str(path))   # 原子替換:讀的人只會看到舊的或新的完整檔案
     except OSError as e:
         warn(f"無法寫入快取:{e}")
 
 
+def cleanup_stale_tmp(project, age=600):
+    """被強制終止時留下的暫存檔(.verify_*.json.<pid>.tmp)10 分鐘後清掉。它們從不被當成快取讀。"""
+    try:
+        for p in (project / ".claude").glob(".verify_*.json.*.tmp"):
+            try:
+                if time.time() - p.stat().st_mtime > age:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------- 工具與環境識別(快取鍵的一部分)
+#
+# 快取只在「檔案內容」與「環境」都沒變時才能沿用,全綠快速路徑也一樣。環境包括:
+#   - 工具執行檔本身(實際路徑 + 大小 + mtime;symlink 換目標也算)
+#   - 相依目錄:node_modules、managed_components、.pio/libdeps、Python 的 site-packages
+#     (逐檔的大小 + mtime —— 套件就地被改時,目錄本身的 mtime 不會變)
+#   - 工具鏈:PlatformIO 平台與套件、ESP-IDF 編譯器、rustup toolchain、Arduino 核心與函式庫
+#   - 相關環境變數
+# 任何一項追不到(例如相依目錄大到超過上限、問不到直譯器的套件目錄)→ 那個驗證器每次都跑,
+# 而且不走全綠快速路徑。
+
+DEP_SCAN_CAP = 300_000
+UNTRACKABLE = "<untrackable>"
+ESP_COMPILERS = ("xtensa-esp32-elf-gcc", "xtensa-esp32s2-elf-gcc", "xtensa-esp32s3-elf-gcc",
+                 "xtensa-esp-elf-gcc", "riscv32-esp-elf-gcc", "xtensa-lx106-elf-gcc")
+# PlatformIO native 平台、Arduino 的部分核心、CMake 都可能用到系統編譯器
+HOST_COMPILERS = ("gcc", "g++", "cc", "c++", "clang", "clang++")
+DEP_DIR_NAMES = ("node_modules", "managed_components")
+
 
 def exe_identity(name):
-    """工具的實際路徑 + 大小 + mtime:升級工具 → 識別改變 → 舊結果作廢。找不到回 None。"""
+    """工具的實際路徑 + 大小 + mtime。升級、換版本(symlink 指到別處)→ 識別改變。找不到回 None。"""
     name = str(name)
     has_sep = ("/" in name) or ("\\" in name)
     path = name if (has_sep and os.path.isfile(name)) else (None if has_sep else shutil.which(name))
     if not path:
         return None
+    real = os.path.realpath(path)
     try:
-        st = os.stat(path)
-        return f"{path}|{st.st_size}|{st.st_mtime_ns}"
+        st = os.stat(real)
+        return f"{path}->{real}|{st.st_size}|{st.st_mtime_ns}"
     except OSError:
-        return path
+        return f"{path}->{real}"
 
 
 def path_sig(path):
@@ -814,9 +973,179 @@ def env_sig(prefixes=(), names=()):
 
 def _read_small(path, limit=4096):
     try:
-        return path.read_text(encoding="utf-8", errors="replace")[:limit]
+        return Path(path).read_text(encoding="utf-8", errors="replace")[:limit]
     except OSError:
         return ""
+
+
+_TREE_MEMO = {}
+_SCAN_CAP = [DEP_SCAN_CAP]   # main() 依設定 dep_scan_cap 覆寫
+
+
+def tree_sig(path, cap=None):
+    """目錄底下每個檔案的(相對路徑, 大小, mtime)。超過上限回 UNTRACKABLE;不存在回 "-"。"""
+    cap = _SCAN_CAP[0] if cap is None else cap
+    key = (str(path), cap)
+    if key in _TREE_MEMO:
+        return _TREE_MEMO[key]
+    root = str(path)
+    if not os.path.isdir(root):
+        _TREE_MEMO[key] = "-"
+        return "-"
+    h = hashlib.blake2b(digest_size=16)
+    n = 0
+    over = False
+    for dirpath, dirs, files in os.walk(root):
+        dirs.sort()
+        rel = os.path.relpath(dirpath, root)
+        for fn in sorted(files):
+            try:
+                st = os.lstat(os.path.join(dirpath, fn))
+            except OSError:
+                continue
+            h.update(f"{rel}/{fn}\0{st.st_size}\0{st.st_mtime_ns}\n".encode("utf-8", "surrogateescape"))
+            n += 1
+            if n > cap:
+                over = True
+                break
+        if over:
+            break
+    res = UNTRACKABLE if over else f"{n}:{h.hexdigest()}"
+    _TREE_MEMO[key] = res
+    return res
+
+
+def listing_sig(path, files=(), depth=1):
+    """子目錄的名稱 + mtime(到 depth 層),以及每個子目錄裡指定檔案(如 package.json)的大小 + mtime。
+    用在工具鏈目錄:裝了、移除、升級套件都會改變它,但不必讀進整個工具鏈。"""
+    base = str(path)
+    if not os.path.isdir(base):
+        return "-"
+    out = []
+
+    def walk(d, level):
+        try:
+            entries = sorted(os.scandir(d), key=lambda e: e.name)
+        except OSError:
+            return
+        for e in entries:
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if not is_dir:
+                continue
+            rel = os.path.relpath(e.path, base)
+            out.append(f"{rel}|{path_sig(e.path)}")
+            for f in files:
+                out.append(f"{rel}/{f}|{path_sig(os.path.join(e.path, f))}")
+            if level < depth:
+                walk(e.path, level + 1)
+    walk(base, 1)
+    return hashlib.sha256("\n".join(out).encode("utf-8", "surrogateescape")).hexdigest()[:32]
+
+
+def _home():
+    return Path(os.environ.get("HOME") or os.environ.get("USERPROFILE") or str(Path.home()))
+
+
+_SITE_SCRIPT = (
+    "import json, site, sys\n"
+    "d = list(getattr(site, 'getsitepackages', lambda: [])())\n"
+    "try:\n"
+    "    if site.ENABLE_USER_SITE:\n"
+    "        d.append(site.getusersitepackages())\n"
+    "except Exception:\n"
+    "    pass\n"
+    "print(json.dumps([sys.version, sys.prefix, d]))\n")
+_PY_MEMO = {}
+
+
+def python_env(py):
+    """專案直譯器的版本、prefix,以及它所有套件目錄的深度簽章。
+    直譯器就是 hook 自己時在程序內問;否則(venv)啟動它問一次(約 30 ms)。問不到 → UNTRACKABLE。"""
+    if py in _PY_MEMO:
+        return _PY_MEMO[py]
+    info = None
+    if py == sys.executable:
+        dirs = list(getattr(site_mod(), "getsitepackages", lambda: [])())
+        try:
+            if site_mod().ENABLE_USER_SITE:
+                dirs.append(site_mod().getusersitepackages())
+        except Exception:
+            pass
+        info = [sys.version, sys.prefix, dirs]
+    else:
+        st, _, text, _ = run_tool([py, "-c", _SITE_SCRIPT], os.getcwd(), 20.0)
+        if st == "ok":
+            try:
+                info = json.loads(text.strip().splitlines()[-1])
+            except Exception:
+                info = None
+    if not (isinstance(info, list) and len(info) == 3 and isinstance(info[2], list)):
+        _PY_MEMO[py] = UNTRACKABLE
+        return UNTRACKABLE
+    parts = [str(info[0]), str(info[1]), path_sig(Path(py).parent.parent / "pyvenv.cfg")]
+    for d in sorted(set(str(x) for x in info[2])):
+        parts.append(f"{d}={tree_sig(d)}")
+    res = "|".join(parts)
+    _PY_MEMO[py] = res
+    return res
+
+
+def site_mod():
+    import site  # noqa: PLC0415  —— 延後到真的需要時才載入
+    return site
+
+
+def platformio_sig():
+    core = Path(os.environ.get("PLATFORMIO_CORE_DIR") or (_home() / ".platformio"))
+    return "pio:" + listing_sig(core / "packages", ("package.json",)) + "|" + \
+        listing_sig(core / "platforms", ("platform.json",))
+
+
+def idf_sig():
+    idf = os.environ.get("IDF_PATH", "")
+    parts = [idf]
+    if idf:
+        parts += [path_sig(Path(idf) / "version.txt"), path_sig(Path(idf) / "tools" / "cmake" / "version.cmake")]
+    parts += [str(exe_identity(c)) for c in ESP_COMPILERS + ("cmake", "ninja")]
+    tools = Path(os.environ.get("IDF_TOOLS_PATH") or (_home() / ".espressif")) / "tools"
+    parts.append(listing_sig(tools, depth=2))
+    return "idf:" + "|".join(parts)
+
+
+def arduino_sig():
+    if os.environ.get("ARDUINO_DIRECTORIES_DATA"):
+        data = Path(os.environ["ARDUINO_DIRECTORIES_DATA"])
+    elif IS_WIN:
+        data = Path(os.environ.get("LOCALAPPDATA", str(_home()))) / "Arduino15"
+    elif sys.platform == "darwin":
+        data = _home() / "Library" / "Arduino15"
+    else:
+        data = _home() / ".arduino15"
+    user = Path(os.environ.get("ARDUINO_DIRECTORIES_USER") or
+                (_home() / ("Documents" if IS_WIN else "") / "Arduino"))
+    libs = tree_sig(user / "libraries")
+    if libs == UNTRACKABLE:
+        return UNTRACKABLE
+    return "arduino:" + listing_sig(data / "packages", depth=4) + "|" + libs
+
+
+def rust_sig():
+    home = Path(os.environ.get("RUSTUP_HOME") or (_home() / ".rustup"))
+    return "rust:" + "|".join([
+        env_sig(prefixes=("CARGO_", "RUSTUP_"), names=("RUSTFLAGS", "RUSTDOCFLAGS", "RUSTC_WRAPPER", "RUSTC")),
+        path_sig(home / "settings.toml"), listing_sig(home / "toolchains")])
+
+
+def deps_sig(ctx, *names):
+    """專案裡(被 SKIP_DIRS 排除的)相依目錄的深度簽章。"""
+    sigs = []
+    for name in names:
+        for p in ctx.dep_dirs(name):
+            sigs.append(f"{ctx.rel(p)}={tree_sig(p)}")
+    return ",".join(sigs)
 
 
 # ---------------------------------------------------------------- 逐檔驗證器的共用件
@@ -1153,9 +1482,16 @@ def run_file_validator(ctx, vid, rels=None):
 
 
 # ---------------------------------------------------------------- 專案層級驗證器
-# spec = dict(vid, label, run=callable→list[Result], inputs=("any"|"precise", rels|None, 原因),
+# spec = dict(vid, label, run=callable→list[Result], inputs=(mode, rels|None, 原因),
 #             env=識別字串, cacheable=bool)
 # 只快取「通過」:失敗可能是環境問題(少裝套件),裝好之後檔案沒變也必須重跑。
+#
+# 追蹤模式(嚴格程度遞增):
+#   precise  輸入能靜態列出 → 只有那些檔案變了才重跑
+#   any      會讀專案裡「列不出來」的檔案 → 專案任何檔案變了就重跑
+#   always   會執行任意程式、讀專案外追不到的東西,或環境追不到 → 每次都跑,也不走全綠快速路徑
+
+MODE_RANK = {"precise": 0, "any": 1, "always": 2}
 
 FW_SOURCE_EXT = (".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".h++",
                  ".ipp", ".tpp", ".inc", ".inl", ".ino", ".pde", ".s", ".asm", ".ld", ".lf", ".csv")
@@ -1163,105 +1499,259 @@ FW_CONFIG_NAMES = {"platformio.ini", "CMakeLists.txt", "sdkconfig", "idf_compone
                    "dependencies.lock", "sketch.yaml", "library.json", "library.properties",
                    "Makefile", "component.mk"}
 FW_CONFIG_GLOBS = ("*.cmake", "sdkconfig.*", "Kconfig*", "*.projbuild")
-# 建置會讀「無法從設定靜態看出來」的檔案時,改成任何變更都重建(保守)。
-FW_DYNAMIC_CMAKE_RE = re.compile(
-    r"\b(?:file\s*\(\s*(?:GLOB|GLOB_RECURSE|READ|STRINGS)\b|configure_file\s*\(|execute_process\s*\("
-    r"|add_custom_command\s*\(|add_custom_target\s*\(|\w*_create_partition_image\s*\(|fatfs_create_\w*_image\s*\()",
-    re.I)
+
 CMAKE_TOKEN_RE = re.compile(r'"[^"]*"|[^\s()"]+|[()]')
 CMAKE_KEYWORD_RE = re.compile(r"[A-Z][A-Z0-9_]+")
+# 會執行任意程式或從網路抓東西:讀什麼完全不知道
+CMAKE_ALWAYS_CMDS = {"execute_process", "add_custom_command", "add_custom_target",
+                     "fetchcontent_declare", "fetchcontent_makeavailable", "externalproject_add"}
+# 會讀專案裡「列不出來」的檔案(萬用字元、整個目錄做成映像檔…)
+CMAKE_ANY_CMDS = {"file", "configure_file", "spiffs_create_partition_image",
+                  "littlefs_create_partition_image", "fatfs_create_spiflash_image",
+                  "fatfs_create_rawflash_image", "fatfs_create_partition_image"}
+CMAKE_DIR_VARS = ("CMAKE_CURRENT_SOURCE_DIR", "CMAKE_CURRENT_LIST_DIR", "COMPONENT_DIR", "COMPONENT_PATH")
+CMAKE_ROOT_VARS = ("CMAKE_SOURCE_DIR", "PROJECT_DIR", "PROJECT_SOURCE_DIR", "CMAKE_HOME_DIRECTORY")
+IDF_REGISTER_PATH_KWS = {"EMBED_FILES", "EMBED_TXTFILES", "SRCS", "SRC_DIRS", "INCLUDE_DIRS",
+                         "PRIV_INCLUDE_DIRS", "EXCLUDE_SRCS", "LDFRAGMENTS", "KCONFIG", "KCONFIG_PROJBUILD"}
+IDF_EMBED_KWS = {"EMBED_FILES", "EMBED_TXTFILES"}
+EXTRA_COMPONENT_VARS = {"EXTRA_COMPONENT_DIRS", "EXTRA_COMPONENTS_DIRS"}
 
 
-def cmake_embedded_tokens(text):
-    """從 CMake 文字取出 EMBED_FILES / EMBED_TXTFILES / target_add_binary_data 的路徑 token。
-    先切 token 再判斷:不加引號的全大寫字是下一個關鍵字;路徑(含 / 或 .)就算大寫也不會被誤判。"""
+def classify_path(project, base, token, local_vars=None):
+    """設定檔裡的一個路徑 → ("in", 專案相對路徑) / ("env", None) / ("out", 原文) / ("unknown", 原文)。
+    env = 落在 ESP-IDF 安裝目錄底下(由工具鏈簽章追蹤)。"""
+    t = token.strip().strip('"').strip("'")
+    for k, v in (local_vars or {}).items():
+        t = t.replace("${%s}" % k, v)
+    for v in CMAKE_DIR_VARS:
+        t = t.replace("${%s}" % v, str(base))
+    for v in CMAKE_ROOT_VARS:
+        t = t.replace("${%s}" % v, str(project)).replace("$%s" % v, str(project))
+    if t.startswith(("$ENV{IDF_PATH}", "${IDF_PATH}", "$IDF_PATH")):
+        return ("env", None)
+    if t.startswith(("${CMAKE_BINARY_DIR}", "${CMAKE_CURRENT_BINARY_DIR}", "${PROJECT_BINARY_DIR}",
+                     "${BUILD_DIR}", "${platformio.build_dir}", "${platformio.packages_dir}")):
+        return ("env", None)  # 建置輸出 / 工具鏈目錄:不是要追的輸入
+    if "$" in t:
+        return ("unknown", token)
+    if t.startswith("~"):
+        t = os.path.expanduser(t)
+    p = Path(t)
+    p = p if p.is_absolute() else Path(base) / p
+    try:
+        return ("in", Path(os.path.normpath(str(p))).relative_to(project).as_posix())
+    except ValueError:
+        return ("out", token)
+
+
+def cmake_commands(text):
+    """切出 CMake 指令 → [(名稱小寫, [參數 token])]。先去註解;參數裡的括號層級照算。"""
     text = re.sub(r"(?m)#.*$", "", text)
     toks = CMAKE_TOKEN_RE.findall(text)
-    out, collecting = [], False
-    for i, t in enumerate(toks):
-        if t in ("EMBED_FILES", "EMBED_TXTFILES"):
-            collecting = True
-            continue
-        if collecting:
-            if t in ("(", ")") or CMAKE_KEYWORD_RE.fullmatch(t):
-                collecting = False
-            else:
-                out.append(t)
-                continue
-        if t.lower() == "target_add_binary_data" and i + 3 < len(toks) and toks[i + 1] == "(":
-            out.append(toks[i + 3])  # target_add_binary_data(<target> <file> ...)
+    out, i = [], 0
+    while i < len(toks):
+        if i + 1 < len(toks) and toks[i + 1] == "(" and toks[i] not in ("(", ")"):
+            name, j, depth, args = toks[i].lower(), i + 2, 1, []
+            while j < len(toks) and depth:
+                if toks[j] == "(":
+                    depth += 1
+                elif toks[j] == ")":
+                    depth -= 1
+                if depth and toks[j] not in ("(", ")"):
+                    args.append(toks[j])
+                j += 1
+            out.append((name, args))
+            i = j
+        else:
+            i += 1
     return out
 
 
-def _norm_rel(project, base_dir, token):
-    """把設定裡寫的路徑轉成專案相對路徑;落在專案外或含變數就回 None(→ 保守模式)。"""
-    token = token.strip().strip('"').strip("'")
-    if not token or "${" in token or "$(" in token:
-        return None
-    p = Path(token)
-    p = p if p.is_absolute() else (base_dir / p)
-    try:
-        return Path(os.path.normpath(str(p))).relative_to(project).as_posix()
-    except ValueError:
-        return None
+def cmake_embedded_tokens(text):
+    """(Stage 2 介面,保留給測試)EMBED_FILES / EMBED_TXTFILES / target_add_binary_data 的路徑 token。"""
+    out = []
+    for cmd, args in cmake_commands(text):
+        if cmd == "target_add_binary_data" and len(args) >= 2:
+            out.append(args[1])
+        kw = None
+        for a in args:
+            if not a.startswith('"') and CMAKE_KEYWORD_RE.fullmatch(a):
+                kw = a
+                continue
+            if kw in IDF_EMBED_KWS:
+                out.append(a)
+    return out
 
 
-def firmware_inputs(ctx):
-    """韌體建置的輸入檔:原始碼/標頭/建置設定 + 設定裡宣告要嵌入的檔案。
-    發現建置會讀「靜態看不出來」的東西(file(GLOB)、configure_file、PlatformIO extra_scripts、
-    嵌入路徑含變數…)就改成任何變更都重建,寧可多建一次也不漏。"""
+def _looks_like_path(tok):
+    t = tok.strip('"')
+    return bool(t) and ("/" in t or "\\" in t or "." in t or t.startswith("$"))
+
+
+def _ini_values(text):
+    """platformio.ini → [(key 小寫, 值)];縮排的續行併進上一個值,行內 ; 註解去掉。"""
+    out, key, buf = [], None, []
+    for line in text.splitlines():
+        if not line.strip() or re.match(r"^\s*[;#]", line):
+            continue
+        if line[:1] in " \t" and key is not None:
+            buf.append(line.strip())
+            continue
+        if key is not None:
+            out.append((key, " ".join(buf)))
+        key, buf = None, []
+        m = re.match(r"^\s*([A-Za-z0-9_.\-]+)\s*=\s*(.*)$", line)
+        if m:
+            key, buf = m.group(1).lower(), [m.group(2).strip()]
+    if key is not None:
+        out.append((key, " ".join(buf)))
+    return [(k, re.sub(r"\s+;.*$", "", v)) for k, v in out]
+
+
+PIO_DIR_KEYS = {"lib_extra_dirs", "src_dir", "include_dir", "lib_dir", "test_dir", "boards_dir",
+                "data_dir", "extra_configs"}
+PIO_FILE_KEYS = {"board_build.embed_files", "board_build.embed_txtfiles", "board_build.partitions",
+                 "board_build.ldscript"}
+PIO_FLAG_KEYS = {"build_flags", "build_src_flags"}
+PIO_INCLUDE_FLAG_RE = re.compile(r"^(?:-I|-iquote|-isystem|-idirafter|-include|-L)(.*)$")
+
+
+def analyze_firmware(ctx):
+    """韌體建置的輸入與追蹤模式 → (mode, rels, 原因)。"""
     pr = ctx.project
-    embedded = set()
+    state = {"mode": "precise", "why": []}
+    extra = set()
+
+    def bump(mode, why):
+        if MODE_RANK[mode] > MODE_RANK[state["mode"]]:
+            state["mode"] = mode
+        if len(state["why"]) < 6:
+            state["why"].append(f"{mode}:{why}")
+
+    def path_arg(src, base, tok, as_input, local_vars=None):
+        kind, info = classify_path(pr, base, tok, local_vars)
+        if kind == "in":
+            if as_input:
+                extra.add(info)
+        elif kind == "out":
+            bump("always", f"{src} 引用專案外的路徑 {clip(str(info), 80)}")
+        elif kind == "unknown":
+            bump("always", f"{src} 的路徑含無法解析的變數 {clip(str(info), 80)}")
+
     for rel in ctx.files():
         name = rel.rsplit("/", 1)[-1]
         if name != "CMakeLists.txt" and not name.endswith(".cmake"):
             continue
-        text = _read_small(pr / rel, 256 * 1024)
-        m = FW_DYNAMIC_CMAKE_RE.search(text)
-        if m:
-            return ("any", None, f"{rel} 使用 {m.group(0).strip()}")
         base = (pr / rel).parent
-        for tok in cmake_embedded_tokens(text):
-            nr = _norm_rel(pr, base, tok)
-            if nr is None:
-                return ("any", None, f"{rel} 的嵌入路徑無法靜態解析:{tok}")
-            embedded.add(nr)
+        cmds = cmake_commands(_read_small(pr / rel, 256 * 1024))
+        # 同一個檔案裡 set(VAR "字面值") 定義一次的變數可以代換;定義多次或值含變數就不代換。
+        seen, local_vars = {}, {}
+        for cmd, args in cmds:
+            if cmd == "set" and len(args) == 2 and "$" not in args[1]:
+                seen.setdefault(args[0], set()).add(args[1].strip('"'))
+        for k, vals in seen.items():
+            if len(vals) == 1:
+                v = next(iter(vals))
+                local_vars[k] = str((base / v)) if not os.path.isabs(v) and _looks_like_path(v) else v
+        for cmd, args in cmds:
+            if cmd in CMAKE_ALWAYS_CMDS:
+                bump("always", f"{rel} 使用 {cmd}()")
+            elif cmd in CMAKE_ANY_CMDS:
+                for a in args[1:]:
+                    if _looks_like_path(a) and not CMAKE_KEYWORD_RE.fullmatch(a):
+                        path_arg(rel, base, a, False, local_vars)
+                bump("any", f"{rel} 使用 {cmd}()")
+            elif cmd == "include" and args:
+                if args[0].lower() in ("fetchcontent", "externalproject"):
+                    bump("always", f"{rel} 使用 include({args[0]})")
+                elif _looks_like_path(args[0]):
+                    path_arg(rel, base, args[0], True, local_vars)
+            elif cmd == "add_subdirectory" and args:
+                path_arg(rel, base, args[0], False, local_vars)
+            elif cmd in ("include_directories", "target_include_directories", "target_sources"):
+                for a in args:
+                    if _looks_like_path(a) and not CMAKE_KEYWORD_RE.fullmatch(a):
+                        path_arg(rel, base, a, False, local_vars)
+            elif cmd in ("set", "list"):
+                var_i = 1 if cmd == "list" else 0
+                if len(args) > var_i and args[var_i] in EXTRA_COMPONENT_VARS:
+                    for a in args[var_i + 1:]:
+                        path_arg(rel, base, a, False, local_vars)
+            elif cmd == "target_add_binary_data" and len(args) >= 2:
+                path_arg(rel, base, args[1], True, local_vars)
+            elif cmd in ("idf_component_register", "register_component"):
+                kw = None
+                for a in args:
+                    if not a.startswith('"') and CMAKE_KEYWORD_RE.fullmatch(a):
+                        kw = a
+                        continue
+                    if kw in IDF_REGISTER_PATH_KWS:
+                        path_arg(rel, base, a, kw in IDF_EMBED_KWS, local_vars)
+
     ini = pr / "platformio.ini"
     if ini.exists():
-        text = _read_small(ini, 256 * 1024)
-        if re.search(r"^\s*extra_scripts\s*=", text, re.M):
-            return ("any", None, "platformio.ini 使用 extra_scripts")
-        for m in re.finditer(r"^\s*board_build\.embed_(?:txt)?files\s*=(.*(?:\n[ \t]+.*)*)", text, re.M):
-            for tok in m.group(1).split():
-                nr = _norm_rel(pr, pr, tok)
-                if nr is None:
-                    return ("any", None, f"platformio.ini 的嵌入路徑無法靜態解析:{tok}")
-                embedded.add(nr)
+        for key, val in _ini_values(_read_small(ini, 256 * 1024)):
+            if key == "extra_scripts":
+                bump("always", "platformio.ini 使用 extra_scripts(任意 Python 程式)")
+            elif key in PIO_DIR_KEYS or key in PIO_FILE_KEYS:
+                for tok in re.split(r"[\s,]+", val):
+                    if tok:
+                        path_arg("platformio.ini", pr, tok, key in PIO_FILE_KEYS or key == "extra_configs")
+            elif key == "lib_deps":
+                for entry in re.split(r"[\n,]+", val):
+                    e = entry.strip()
+                    for scheme in ("file://", "symlink://"):
+                        if e.startswith(scheme):
+                            path_arg("platformio.ini", pr, e[len(scheme):], False)
+                    if e.startswith(("/", "./", "../", "~")) or re.match(r"^[A-Za-z]:[\\/]", e):
+                        path_arg("platformio.ini", pr, e, False)
+            elif key in PIO_FLAG_KEYS:
+                toks = val.split()
+                for i, tok in enumerate(toks):
+                    m = PIO_INCLUDE_FLAG_RE.match(tok)
+                    if m:
+                        target = m.group(1) or (toks[i + 1] if i + 1 < len(toks) else "")
+                        if target.startswith("${platformio.packages_dir}"):
+                            continue  # 工具鏈目錄:由工具鏈簽章追蹤
+                        if target:
+                            path_arg("platformio.ini", pr, target, False)
+
     rels = []
     for rel in ctx.files():
         name = rel.rsplit("/", 1)[-1]
-        if (rel in embedded or name in FW_CONFIG_NAMES or name.lower().endswith(FW_SOURCE_EXT)
+        if (rel in extra or name in FW_CONFIG_NAMES or name.lower().endswith(FW_SOURCE_EXT)
                 or any(fnmatch.fnmatch(name, g) for g in FW_CONFIG_GLOBS)):
             rels.append(rel)
-    missing_embeds = sorted(e for e in embedded if e not in ctx.manifest.entries)
-    reason = f"原始碼/設定 {len(rels)} 個檔案,嵌入 {len(embedded)} 個"
-    if missing_embeds:
-        reason += f"(其中 {len(missing_embeds)} 個不存在,建置應會失敗)"
-    return ("precise", rels + missing_embeds, reason)
+    missing = sorted(e for e in extra if e not in ctx.manifest.entries)
+    why = state["why"] or [f"precise:原始碼/設定 {len(rels)} 個檔案,嵌入 {len(extra)} 個"
+                           + (f"(其中 {len(missing)} 個不存在)" if missing else "")]
+    return state["mode"], rels + missing, ";".join(why)
+
+
+def firmware_inputs(ctx):
+    """(Stage 2 介面)→ (mode, rels, 原因)"""
+    return analyze_firmware(ctx)
+
+
+def _with_env_mode(mode, why, env):
+    """環境識別裡有追不到的東西 → 強制 always。"""
+    if UNTRACKABLE in env:
+        return "always", why + ";always:相依目錄太大或問不到直譯器的套件目錄,無法追蹤"
+    return mode, why
 
 
 def spec_firmware(ctx):
     pr = ctx.project
     if (pr / "platformio.ini").exists():
-        cmd, label = ["pio", "run"], "PlatformIO 建置"
+        cmd, label, chain = ["pio", "run"], "PlatformIO 建置", platformio_sig
     elif (pr / "CMakeLists.txt").exists() and (
             (pr / "sdkconfig").exists() or (pr / "sdkconfig.defaults").exists()
             or (pr / "main" / "idf_component.yml").exists()):
-        cmd, label = ["idf.py", "build"], "ESP-IDF 建置"
+        cmd, label, chain = ["idf.py", "build"], "ESP-IDF 建置", idf_sig
     elif (pr / "sketch.yaml").exists():
         prof = pr / ".claude" / "arduino-profile"
         p = prof.read_text(encoding="utf-8").strip() if prof.exists() else "default"
-        cmd, label = ["arduino-cli", "compile", "--profile", p], "arduino-cli 編譯"
+        cmd, label, chain = ["arduino-cli", "compile", "--profile", p], "arduino-cli 編譯", arduino_sig
     else:
         inos = ctx.glob("*.ino")
         fqbn = pr / ".claude" / "fqbn"
@@ -1269,13 +1759,16 @@ def spec_firmware(ctx):
             return None
         cmd = ["arduino-cli", "compile", "-b", fqbn.read_text(encoding="utf-8").strip(),
                str(inos[0].parent)]
-        label = "arduino-cli 編譯"
-    env = "|".join([str(exe_identity(cmd[0])), " ".join(cmd),
+        label, chain = "arduino-cli 編譯", arduino_sig
+    env = "|".join([str(exe_identity(cmd[0])), " ".join(cmd), chain(),
+                    ",".join(f"{c}={exe_identity(c)}" for c in HOST_COMPILERS),
                     _read_small(pr / ".claude" / "fqbn"), _read_small(pr / ".claude" / "arduino-profile"),
-                    path_sig(pr / ".pio" / "libdeps"), path_sig(pr / "managed_components"),
+                    deps_sig(ctx, "managed_components"), f"libdeps={tree_sig(pr / '.pio' / 'libdeps')}",
                     env_sig(prefixes=("IDF_", "PLATFORMIO_", "ESP_IDF", "ARDUINO_"))])
+    mode, rels, why = analyze_firmware(ctx)
+    mode, why = _with_env_mode(mode, why, env)
     return dict(vid="firmware", label=label, run=lambda: [ctx.tool("firmware", label, cmd)],
-                inputs=firmware_inputs(ctx), env=env, cacheable=True)
+                inputs=(mode, rels, why), env=env, cacheable=True)
 
 
 def spec_opencore(ctx):
@@ -1293,7 +1786,7 @@ def spec_opencore(ctx):
     prefix = "" if base == "." else base + "/"
     rels = [r for r in ctx.files() if r.startswith(prefix)]
     return dict(vid="opencore", label=label, run=run, env=str(exe_identity("ocvalidate")),
-                inputs=("precise", rels, f"{prefix or './'} 底下 {len(rels)} 個檔案"), cacheable=True)
+                inputs=("precise", rels, f"precise:{prefix or './'} 底下 {len(rels)} 個檔案"), cacheable=True)
 
 
 def spec_adblock(ctx):
@@ -1306,19 +1799,10 @@ def spec_adblock(ctx):
     def failed(rc, text):
         return rc != 0 or bool(re.search(r"\d+:\d+\s+error\b", text))
     label = "AdGuard 規則(aglint)"
-    env = "|".join([str(exe_identity(runner[0])), path_sig(ctx.project / "node_modules" / ".package-lock.json")])
+    env = "|".join([str(exe_identity(runner[0])), str(exe_identity("node")), deps_sig(ctx, "node_modules")])
+    mode, why = _with_env_mode("any", "any:規則檔可能是任何副檔名", env)
     return dict(vid="adblock", label=label, run=lambda: [ctx.tool("adblock", label, runner, fail_detect=failed)],
-                inputs=("any", None, "規則檔可能是任何副檔名"), env=env, cacheable=True)
-
-
-def _venv_sig(project):
-    sigs = []
-    for vdir in (".venv", "venv"):
-        base = project / vdir
-        if base.is_dir():
-            for sp in sorted(list(base.glob("lib/python*/site-packages")) + list(base.glob("Lib/site-packages"))):
-                sigs.append(f"{sp.name}:{path_sig(sp)}")
-    return ",".join(sigs)
+                inputs=(mode, None, why), env=env, cacheable=True)
 
 
 def check_pytest(ctx):
@@ -1352,11 +1836,13 @@ def spec_pytest(ctx):
     if not ctx.glob("*.py") or not _has_tests(ctx):
         return None
     py = project_python(ctx.project)
-    env = "|".join([str(exe_identity(py)), _venv_sig(ctx.project),
-                    env_sig(names=("PYTHONPATH", "VIRTUAL_ENV", "PYTEST_ADDOPTS"))])
+    env = "|".join([str(exe_identity(py)), python_env(py),
+                    env_sig(names=("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "PYTEST_ADDOPTS",
+                                   "PYTEST_PLUGINS", "PYTHONUSERBASE"))])
     # 測試可能讀專案裡任何檔案(fixture、資料、設定),無法靜態判斷 → 任何變更都重跑。
+    mode, why = _with_env_mode("any", "any:測試可能讀取任何檔案", env)
     return dict(vid="pytest", label="pytest", run=lambda: check_pytest(ctx),
-                inputs=("any", None, "測試可能讀取任何檔案"), env=env, cacheable=True)
+                inputs=(mode, None, why), env=env, cacheable=True)
 
 
 def _node_cmd(ctx):
@@ -1377,20 +1863,22 @@ def spec_node(ctx):
     if cmd is None:
         return None
     label = " ".join(cmd)
-    nm = ctx.project / "node_modules"
-    env = "|".join([str(exe_identity("npm")), str(exe_identity("node")), path_sig(nm),
-                    path_sig(nm / ".package-lock.json"), env_sig(names=("NODE_ENV", "NODE_OPTIONS"))])
+    env = "|".join([str(exe_identity("npm")), str(exe_identity("node")), deps_sig(ctx, "node_modules"),
+                    path_sig(_home() / ".npmrc"), path_sig(_home() / ".tool-versions"),
+                    env_sig(prefixes=("npm_config_", "NPM_CONFIG_"), names=("NODE_ENV", "NODE_OPTIONS", "NODE_PATH"))])
+    mode, why = _with_env_mode("any", "any:測試/打包可能讀取任何檔案", env)
     return dict(vid="node", label=label, run=lambda: [ctx.tool("node", label, cmd)],
-                inputs=("any", None, "測試/打包可能讀取任何檔案"), env=env, cacheable=True)
+                inputs=(mode, None, why), env=env, cacheable=True)
 
 
 def spec_rust(ctx):
     if not (ctx.project / "Cargo.toml").exists():
         return None
-    env = "|".join([str(exe_identity("cargo")), str(exe_identity("rustc")), env_sig(names=("RUSTFLAGS",))])
+    env = "|".join([str(exe_identity("cargo")), str(exe_identity("rustc")), rust_sig()])
+    mode, why = _with_env_mode("any", "any:build.rs / include_str! / 測試可能讀取任何檔案", env)
     return dict(vid="rust", label="cargo test",
                 run=lambda: [ctx.tool("rust", "cargo test", ["cargo", "test", "--quiet"])],
-                inputs=("any", None, "build.rs / include_str! / 測試可能讀取任何檔案"), env=env, cacheable=True)
+                inputs=(mode, None, why), env=env, cacheable=True)
 
 
 # ---- Stage 1 介面(不經快取):回傳 list[Result],不適用回傳 []
@@ -1483,58 +1971,117 @@ def run_override(ctx, f):
     return [ctx.tool("override", f"專案自訂驗證 .claude/{f.name}", _override_cmd(f))]
 
 
+# 自訂腳本可能呼叫任何工具;開了 override_cache 時,這些工具的識別都算進環境。
+BROAD_TOOLS = ("sh", "bash", "python3", "python", "node", "npm", "npx", "pytest", "make", "cmake",
+               "gcc", "cc", "clang", "cargo", "go", "java", "ruby", "pio", "idf.py", "arduino-cli")
+
+
 def spec_override(ctx, f):
     cmd = _override_cmd(f)
     label = f"專案自訂驗證 .claude/{f.name}"
-    # 自訂腳本讀什麼完全不知道 → 任何檔案變更都重跑;override_cache=false 則每次都跑(Stage 1 行為)。
-    return dict(vid="override", label=label, run=lambda: [ctx.tool("override", label, cmd)],
-                inputs=("any", None, "自訂腳本可能讀取任何檔案"), env=str(exe_identity(cmd[0])),
-                cacheable=bool(ctx.cfg["override_cache"]))
+    run = lambda: [ctx.tool("override", label, cmd)]  # noqa: E731
+    if not ctx.cfg["override_cache"]:
+        # 預設:自訂腳本讀什麼、依賴什麼完全不知道 → 每次都跑(Stage 1 行為)
+        return dict(vid="override", label=label, run=run, env="",
+                    inputs=("always", None, "always:override_cache=false,自訂驗證每次都跑"), cacheable=False)
+    py = project_python(ctx.project)
+    env = "|".join([str(exe_identity(cmd[0]))] + [f"{t}={exe_identity(t)}" for t in BROAD_TOOLS] + [
+        env_sig(names=("PATH",)), python_env(py), deps_sig(ctx, "node_modules", "managed_components"),
+        f"libdeps={tree_sig(ctx.project / '.pio' / 'libdeps')}", platformio_sig(), idf_sig(), rust_sig()])
+    mode, why = _with_env_mode("any", "any:自訂腳本可能讀取任何檔案(override_cache=true)", env)
+    return dict(vid="override", label=label, run=run, inputs=(mode, None, why), env=env, cacheable=True)
 
 
 # ---------------------------------------------------------------- 排程:決定誰要跑、誰沿用快取
 
-def plan_and_run(ctx, cache_results, override=None):
+def collect_specs(ctx, override=None):
+    """列出所有適用的驗證器(全綠快速路徑的環境比對與實際排程共用同一份)。
+    回傳 (entries, errors):
+      entries: ("file", idx, vid, targets, tool_id, missing_result) 或 ("project", idx, vid, spec)
+      errors:  {idx: [Result(error)]}  —— 建立規格時就出錯的驗證器"""
+    entries, errors = [], {}
+    if override is not None:
+        entries.append(("project", 0, "override", spec_override(ctx, override)))
+        return entries, errors
+    for idx, (vid, spec_fn) in enumerate(PIPELINE):
+        try:
+            if spec_fn is None:
+                label, patterns, runner, ident = FILE_VALIDATORS[vid]
+                targets = ctx.glob_rel(*patterns)
+                if not targets:
+                    continue
+                tool_id, missing = ident(ctx)
+                entries.append(("file", idx, vid, targets, tool_id, missing))
+            else:
+                spec = spec_fn(ctx)
+                if spec is not None:
+                    entries.append(("project", idx, vid, spec))
+        except Exception as e:
+            errors[idx] = [Result(vid, vid, "error", [f"內部錯誤:{clip(repr(e), 200)}"])]
+    return entries, errors
+
+
+def environment_digest(entries, chash):
+    """所有適用驗證器的工具與環境識別 + 設定雜湊。全綠指紋與防迴圈指紋都含它。"""
+    h = hashlib.sha256(f"{VERSION}\0{chash}\n".encode())
+    for e in entries:
+        if e[0] == "file":
+            h.update(f"{e[2]}|{e[4]}|{e[5] is not None}\n".encode("utf-8", "surrogateescape"))
+        else:
+            h.update(f"{e[2]}|{e[3]['inputs'][0]}|{e[3]['env']}\n".encode("utf-8", "surrogateescape"))
+    return h.hexdigest()
+
+
+def needs_every_run(entries, errors):
+    """有 always 模式的驗證器或建立規格就出錯 → 不可以走全綠快速路徑。"""
+    return bool(errors) or any(e[0] == "project" and e[3]["inputs"][0] == "always" for e in entries)
+
+
+def plan_and_run(ctx, cache_results, entries=None, errors=None, chash="", override=None):
     """回傳 (results 依固定順序, 新的快取結果, debug 計畫)。"""
+    if entries is None:
+        entries, errors = collect_specs(ctx, override)
     use_cache = bool(ctx.cfg["cache"])
     man = ctx.manifest
     all_digest = man.digest()
-    resolved, jobs, plan, new_cache = {}, [], [], {}
+    resolved, jobs, plan, new_cache = dict(errors or {}), [], [], {}
+    for idx in resolved:
+        plan.append({"id": PIPELINE[idx][0] if idx < len(PIPELINE) else str(idx), "action": "error"})
 
     def project_job(idx, spec):
         vid = spec["vid"]
         mode, rels, why = spec["inputs"]
-        idig = all_digest if mode == "any" else man.digest(rels)
-        key = hashlib.sha256("\0".join([vid, str(VALIDATOR_VERSIONS[vid]), spec["env"], mode, idig])
+        idig = man.digest(rels) if mode == "precise" else all_digest
+        key = hashlib.sha256("\0".join([vid, str(VALIDATOR_VERSIONS[vid]), chash, spec["env"], mode, idig])
                              .encode("utf-8", "surrogateescape")).hexdigest()
         # precise 模式:任何檔案被刪除都重跑 —— 被刪的可能是建置用到、但我們沒認出來的檔案
         forced = mode == "precise" and bool(man.deleted)
-        prev = cache_results.get(vid) if (use_cache and spec["cacheable"]) else None
+        cacheable = spec["cacheable"] and mode != "always"
+        prev = cache_results.get(vid) if (use_cache and cacheable) else None
         if isinstance(prev, dict) and prev.get("key") == key and prev.get("status") == "pass" and not forced:
             resolved[idx] = [Result(vid, spec["label"], "pass", meta={"cached": True})]
             new_cache[vid] = prev
-            plan.append({"id": vid, "action": "cached", "why": f"輸入未變({mode}:{why})"})
+            plan.append({"id": vid, "action": "cached", "why": f"輸入與環境未變({why})"})
             return
-        reason = "有檔案被刪除" if forced else ("沒有快取" if not prev else "輸入或環境有變")
-        plan.append({"id": vid, "action": "run", "why": f"{reason}({mode}:{why})"})
+        if mode == "always":
+            reason = "每次都跑"
+        else:
+            reason = "有檔案被刪除" if forced else ("沒有快取" if not prev else "輸入或環境有變")
+        plan.append({"id": vid, "action": "run", "why": f"{reason}({why})"})
 
         def job():
             res = spec["run"]()
             ok = all(r.status == "pass" for r in res)
-            return res, ({"key": key, "status": "pass"} if ok and spec["cacheable"] else None)
+            return res, ({"key": key, "status": "pass"} if ok and cacheable else None)
         jobs.append((idx, vid, vid in HEAVY, job))
 
-    def file_job(idx, vid):
+    def file_job(idx, vid, targets, tool_id, missing):
         label, patterns, runner, ident = FILE_VALIDATORS[vid]
-        targets = ctx.glob_rel(*patterns)
-        if not targets:
-            return
-        tool_id, missing = ident(ctx)
         if missing is not None:
             resolved[idx] = [missing]
             plan.append({"id": vid, "action": "missing", "why": missing.lines[0]})
             return
-        tool_key = f"{vid}:{VALIDATOR_VERSIONS[vid]}:{tool_id}"
+        tool_key = f"{vid}:{VALIDATOR_VERSIONS[vid]}:{chash}:{tool_id}"
         prev = cache_results.get(vid) if use_cache else None
         prev_files = prev.get("files") if (isinstance(prev, dict) and prev.get("tool") == tool_key
                                            and isinstance(prev.get("files"), dict)) else {}
@@ -1565,22 +2112,20 @@ def plan_and_run(ctx, cache_results, override=None):
                          "files": todo[:20]})
             jobs.append((idx, vid, False, job))
 
-    if override is not None:
-        project_job(0, spec_override(ctx, override))
-    else:
-        for idx, (vid, spec_fn) in enumerate(PIPELINE):
-            try:
-                if spec_fn is None:
-                    file_job(idx, vid)
-                else:
-                    spec = spec_fn(ctx)
-                    if spec is None:
-                        if ctx.debug:
-                            plan.append({"id": vid, "action": "n/a"})
-                        continue
-                    project_job(idx, spec)
-            except Exception as e:
-                resolved[idx] = [Result(vid, vid, "error", [f"內部錯誤:{clip(repr(e), 200)}"])]
+    present = set()
+    for e in entries:
+        present.add(e[1])
+        try:
+            if e[0] == "file":
+                file_job(e[1], e[2], e[3], e[4], e[5])
+            else:
+                project_job(e[1], e[3])
+        except Exception as ex:
+            resolved[e[1]] = [Result(e[2], e[2], "error", [f"內部錯誤:{clip(repr(ex), 200)}"])]
+    if ctx.debug and override is None:
+        for idx, (vid, _) in enumerate(PIPELINE):
+            if idx not in present and idx not in resolved:
+                plan.append({"id": vid, "action": "n/a"})
 
     for idx, (res, entry) in execute_jobs(ctx, jobs).items():
         resolved[idx] = res
@@ -1633,11 +2178,24 @@ def execute_jobs(ctx, jobs):
 # ---------------------------------------------------------------- 狀態、紀錄、輸出
 
 def load_state(project):
+    """讀防迴圈狀態;型別不對的欄位丟掉(舊版遇到 blocks="x" 會崩潰 → 放行)。"""
     try:
         st = json.loads((project / ".claude" / STATE_NAME).read_text(encoding="utf-8"))
-        return st if isinstance(st, dict) else {}
     except Exception:
         return {}
+    if not isinstance(st, dict):
+        return {}
+    clean = {}
+    if isinstance(st.get("session"), str):
+        clean["session"] = st["session"]
+    if _is_int(st.get("blocks")) and st["blocks"] >= 0:
+        clean["blocks"] = st["blocks"]
+    if isinstance(st.get("block_fp"), str):
+        clean["block_fp"] = st["block_fp"]
+    lb = st.get("last_block")
+    if isinstance(lb, list) and all(isinstance(x, str) for x in lb):
+        clean["last_block"] = lb
+    return clean
 
 
 def save_state(project, state):
@@ -1770,9 +2328,17 @@ def read_input():
     return data if isinstance(data, dict) else {}
 
 
-def main():
+def composite_fp(manifest, env_digest):
+    """全綠快速路徑與防迴圈共用的指紋:檔案內容 + 環境(工具、相依、設定)。
+    只比檔案的話,換了 Python、升級套件、改了編譯器卻沒動專案檔 → 會沿用舊的通過。"""
+    return hashlib.sha256(f"{fingerprint(manifest)}\0{env_digest}".encode()).hexdigest()
+
+
+def main(data, fallback=False):
     t0 = time.monotonic()
-    data = read_input()
+    _TREE_MEMO.clear()
+    _PY_MEMO.clear()
+    _SCAN_CAP[0] = DEP_SCAN_CAP
     project = Path(os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd())
     try:
         project = project.resolve()
@@ -1785,7 +2351,9 @@ def main():
 
     notes = []
     cfg = load_config(project, notes)
-    state = load_state(project)
+    _SCAN_CAP[0] = int(cfg["dep_scan_cap"])
+    chash = config_hash(cfg)
+    state = {} if fallback else load_state(project)
     session = str(data.get("session_id") or "")
     active = bool(data.get("stop_hook_active"))
     if not active or state.get("session") != session:
@@ -1794,11 +2362,18 @@ def main():
     state["session"] = session
 
     ctx = Ctx(project, cfg, t0)
-    cache = load_cache(project)
+    cleanup_stale_tmp(project)
+    cache = _empty_cache("fallback") if fallback else load_cache(project, chash)
+    if fallback:
+        notes.append("hook 第一次執行時內部出錯(可能是快取或狀態檔損壞),這次不用快取、完整驗證")
     manifest = Manifest(project, cache["manifest"], cfg["trust_mtime"]).scan(
         ctx.files() + claude_extras(project))
     ctx.manifest = manifest
-    fp_before = fingerprint(manifest)
+    override = find_override(project)
+    entries, spec_errors = collect_specs(ctx, override)
+    env_d = environment_digest(entries, chash)
+    every_run = needs_every_run(entries, spec_errors)
+    fp_before = composite_fp(manifest, env_d)
 
     if active:
         if not cfg["rerun_when_active"]:
@@ -1809,7 +2384,7 @@ def main():
             append_log(project, {"decision": "allow-unchanged", "active": True,
                                  "last_block": state.get("last_block")})
             finish(cfg, system=warning_message([], notes + [
-                "上次擋下後專案檔案沒有變更,本次不重驗、直接放行以免卡死。"
+                "上次擋下後專案檔案與環境都沒有變更,本次不重驗、直接放行以免卡死。"
                 f"上次未通過:{last}(這不是通過,請自行確認)。"]))
         cap = cfg["max_consecutive_blocks"]
         if cap and state.get("blocks", 0) >= cap:
@@ -1820,13 +2395,12 @@ def main():
                 f"已連續擋下 {cap} 次仍未通過,放行交還給你。上次未通過:{last}(這不是通過);"
                 f"紀錄在 .claude/{LOG_NAME}。"]))
 
-    override = find_override(project)
-    if state.get("ok_fp") == fp_before and (override is None or cfg["override_cache"]):
+    if not every_run and cache["ok_fp"] is not None and cache["ok_fp"] == fp_before:
         if ctx.debug:
             append_log(project, {"decision": "allow-unchanged-green", "changes": manifest.changes()})
-        finish(cfg, system=warning_message([], notes))  # 自上次全綠後沒有任何變更
+        finish(cfg, system=warning_message([], notes))  # 檔案與環境都和上次全綠時相同
 
-    results, new_cache, plan = plan_and_run(ctx, cache["results"], override)
+    results, new_cache, plan = plan_and_run(ctx, cache["results"], entries, spec_errors, chash, override)
 
     blocking, warnings = [], []
     for r in results:
@@ -1845,14 +2419,18 @@ def main():
     ctx.reset_files()
     after = Manifest(project, manifest.entries, cfg["trust_mtime"]).scan(
         ctx.files() + claude_extras(project))
-    fp_after = fingerprint(after)
-    save_cache(project, after, new_cache)
+    fp_after = composite_fp(after, env_d)
+    green = not blocking and not every_run and not any(r.status in ("timeout", "error") for r in results)
+    # 全綠紀錄跟快取寫在同一個檔、同一次原子替換:快取被刪或寫壞,全綠紀錄跟著失效。
+    save_cache(project, after, new_cache, fp_after if green else None, chash)
     record = {
         "decision": "block" if blocking else "allow", "active": active,
         "sec": round(time.monotonic() - t0, 2),
         "results": [r.as_log() for r in results],
         "suspect": [r.vid for r in results if r.status == "timeout"],
     }
+    if cache["status"] not in ("ok", "missing"):
+        record["cache"] = cache["status"]
     if ctx.debug:
         record["changes"] = manifest.changes()
         record["plan"] = plan
@@ -1862,7 +2440,6 @@ def main():
         state["blocks"] = state.get("blocks", 0) + 1
         state["block_fp"] = fp_after
         state["last_block"] = [f"{r.vid}:{r.status}" for r in blocking]
-        state.pop("ok_fp", None)
         save_state(project, state)
         finish(cfg, "block", build_reason(blocking, warnings, cfg),
                warning_message(warnings, notes))
@@ -1870,29 +2447,33 @@ def main():
     state["blocks"] = 0
     state.pop("block_fp", None)
     state.pop("last_block", None)
-    if any(r.status in ("timeout", "error") for r in results):
-        state.pop("ok_fp", None)  # 沒驗完不算綠,下次重驗
-    elif override is None or cfg["override_cache"]:
-        state["ok_fp"] = fp_after
-    else:
-        state.pop("ok_fp", None)
     save_state(project, state)
     finish(cfg, system=warning_message(warnings, notes))
 
 
 def entry():
+    install_signal_handlers()
+    data = read_input()
     try:
-        main()
+        main(data)
     except SystemExit:
         raise
-    except BaseException as e:  # hook 自己壞掉:放行(Claude 修不了 hook),但讓使用者看到
-        warn(f"內部錯誤:{e!r}")
+    except BaseException as e:
+        # 第一次失敗多半是快取或狀態檔有問題:不用它們、完整驗證再試一次。
+        # 兩次都失敗才放行(Claude 修不了 hook),而且讓使用者看到。
+        warn(f"內部錯誤:{e!r};改為不使用快取的完整驗證重試")
         try:
-            print(json.dumps({"systemMessage": f"verify.py 內部錯誤,本次未驗證:{clip(repr(e), 300)}"},
-                             ensure_ascii=True))
-        except Exception:
-            pass
-        sys.exit(0)
+            main(data, fallback=True)
+        except SystemExit:
+            raise
+        except BaseException as e2:
+            warn(f"重試仍失敗:{e2!r}")
+            try:
+                print(json.dumps({"systemMessage": f"verify.py 內部錯誤,本次未驗證:{clip(repr(e2), 300)}"},
+                                 ensure_ascii=True))
+            except Exception:
+                pass
+            sys.exit(0)
 
 
 if __name__ == "__main__":

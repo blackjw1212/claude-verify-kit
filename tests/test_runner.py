@@ -129,8 +129,9 @@ def test_timeout_is_never_recorded_as_success(project):
     configure(project, on_timeout="warn", validators={"override": {"timeout": 1}})
     r1 = run_hook(project)
     assert not r1.blocked
-    state = json.loads((project / ".claude/.verify_state.json").read_text(encoding="utf-8"))
-    assert "ok_fp" not in state                     # 沒有寫入「上次全綠」
+    # 深度驗收後:全綠紀錄和快取放在同一個檔(同一次原子寫入),不在狀態檔
+    cache = json.loads((project / ".claude/.verify_cache.json").read_text(encoding="utf-8"))
+    assert cache["ok_fp"] is None                     # 沒有寫入「上次全綠」
     rec = read_log(project)[-1]
     assert [x["status"] for x in rec["results"]] == ["timeout"]
     r2 = run_hook(project)                          # 沒有任何變更也必須重跑,不可走快速路徑
@@ -264,8 +265,9 @@ def test_timeout_in_builtin_check_is_never_recorded_as_success(project):
     configure(project, on_timeout="warn", validators={"pytest": {"timeout": 1}})
     r1 = run_hook(project)
     assert not r1.blocked and "逾時" in r1.system, r1
-    state = json.loads((project / ".claude/.verify_state.json").read_text(encoding="utf-8"))
-    assert "ok_fp" not in state
+    # 深度驗收後:全綠紀錄和快取放在同一個檔(同一次原子寫入),不在狀態檔
+    cache = json.loads((project / ".claude/.verify_cache.json").read_text(encoding="utf-8"))
+    assert cache["ok_fp"] is None
     assert [x["status"] for x in read_log(project)[-1]["results"] if x["id"] == "pytest"] == ["timeout"]
     run_hook(project)                              # 沒有任何變更也必須重跑
     assert len(read_log(project)) == 2

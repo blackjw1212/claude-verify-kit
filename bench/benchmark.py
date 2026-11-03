@@ -3,10 +3,14 @@
 """verify.py 的效能基準:同一個合成專案、同樣的修改,量不同版本的 Stop hook 總耗時。
 
 情境(每個版本各自從冷啟動開始,之後依序重複):
-  cold   第一次執行(沒有任何快取 / 標記)
-  s1     無變更:上一輪全綠之後什麼都沒改
+  cold   冷啟動:第一次執行(沒有任何快取 / 標記)
+  s1     暖啟動 / 無變更:上一輪全綠之後什麼都沒改
   s2     只改一個 JSON
+  s4     改一個 Python 原始碼
   s3     改了一個韌體原始碼(.cpp)
+  s5     工具版本變更:pio 執行檔本身變了,專案檔一個字沒動(應該重建)
+  s6     快取失效:把 hook 的快取 / 狀態檔全部刪掉(完整重驗的成本)
+「重建?」欄記錄那一次有沒有真的呼叫建置工具 —— 跑得快但沒重建,不等於比較好。
 
 合成專案:PlatformIO 韌體(src/*.cpp、include/*.h)+ data/*.json + scripts/*.sh
 + tools/*.py 與 tests/(pytest)+ docs/*.md。
@@ -70,12 +74,18 @@ def make_project(dst, sizes):
         w(f"tests/test_util{i:03d}.py", f"from tools.util{i:03d} import util{i}\n{body}")
     for i in range(sizes["md"]):
         w(f"docs/page{i:02d}.md", f"# Page {i}\n\nText.\n")
+    if sizes.get("node_modules"):
+        w("package.json", json.dumps({"name": "bench", "version": "1.0.0",
+                                      "scripts": {"test": "node -e \"process.exit(0)\""}}))
+        for i in range(sizes["node_modules"]):
+            w(f"node_modules/pkg{i // 100:03d}/lib/f{i % 100:02d}.js", "module.exports = 1;\n")
 
 
-def make_fake_pio(bindir, seconds):
+def make_fake_pio(bindir, seconds, counter, version="1"):
     bindir.mkdir(parents=True, exist_ok=True)
     pio = bindir / "pio"
-    pio.write_text(f"#!/bin/sh\nsleep {seconds}\necho 'fake pio: build ok'\nexit 0\n", encoding="utf-8")
+    pio.write_text(f"#!/bin/sh\n# fake pio version {version}\nprintf x >> \"{counter}\"\n"
+                   f"sleep {seconds}\necho 'fake pio: build ok'\nexit 0\n", encoding="utf-8")
     pio.chmod(0o755)
 
 
@@ -89,18 +99,29 @@ def run_once(hook, project, env):
     return dt, blocked, out
 
 
+TAGS = ("s1", "s2", "s4", "s3", "s5", "s6", "cold")
+
+
 def bench_rev(rev, template, workdir, args, env):
-    proj = workdir / f"proj-{rev.replace('/', '_')}"
+    slug = rev.replace("/", "_")
+    proj = workdir / f"proj-{slug}"
     shutil.copytree(template, proj)
-    hook = workdir / f"verify-{rev.replace('/', '_')}.py"
+    hook = workdir / f"verify-{slug}.py"
     hook.write_text(hook_source(rev), encoding="utf-8")
-    e = dict(env, CLAUDE_PROJECT_DIR=str(proj))
-    times = {"cold": [], "s1": [], "s2": [], "s3": []}
+    bindir = workdir / f"bin-{slug}"
+    counter = workdir / f"pio-calls-{slug}"
+    counter.write_text("", encoding="utf-8")
+    make_fake_pio(bindir, args.build_seconds, counter)
+    e = dict(env, CLAUDE_PROJECT_DIR=str(proj), PATH=f"{bindir}{os.pathsep}{env.get('PATH', '')}")
+    times = {t: [] for t in TAGS}
+    rebuilt = {t: [] for t in TAGS}
     problems = []
 
     def go(tag):
+        before = len(counter.read_text(encoding="utf-8"))
         dt, blocked, out = run_once(hook, proj, e)
         times[tag].append(dt)
+        rebuilt[tag].append(len(counter.read_text(encoding="utf-8")) > before)
         if blocked:
             problems.append(f"{tag}: blocked — {out[:200]}")
 
@@ -109,18 +130,30 @@ def bench_rev(rev, template, workdir, args, env):
         go("s1")
         (proj / "data" / "item007.json").write_text(json.dumps({"id": 7, "rev": k + 1}), encoding="utf-8")
         go("s2")
+        (proj / "tools" / "util005.py").write_text(f"def util5(x):\n    return x * 5  # rev {k}\n",
+                                                   encoding="utf-8")
+        go("s4")
         p = proj / "src" / "mod005.cpp"
         p.write_text(p.read_text(encoding="utf-8") + f"// edit {k}\n", encoding="utf-8")
         go("s3")
-    return times, problems
+        make_fake_pio(bindir, args.build_seconds, counter, version=f"2.{k}")
+        go("s5")
+        for name in (".verify_cache.json", ".verify_state.json", ".last_verify_ok"):
+            f = proj / ".claude" / name
+            if f.exists():
+                f.unlink()
+        go("s6")
+    return times, rebuilt, problems
 
 
-def fmt(xs):
+def fmt(xs, rb=None):
     if not xs:
         return "—"
-    if len(xs) == 1:
-        return f"{xs[0]:.2f}"
-    return f"{statistics.median(xs):.2f}({min(xs):.2f}–{max(xs):.2f})"
+    t = f"{xs[0]:.2f}" if len(xs) == 1 else f"{statistics.median(xs):.2f}({min(xs):.2f}–{max(xs):.2f})"
+    if rb is not None:
+        n = sum(rb)
+        t += " 重建" if n == len(rb) else (" **未重建**" if n == 0 else f" 重建 {n}/{len(rb)}")
+    return t
 
 
 def tool_version(cmd):
@@ -139,18 +172,21 @@ def main():
     ap.add_argument("--build-seconds", type=float, default=3.0)
     ap.add_argument("--out", default="")
     ap.add_argument("--small", action="store_true", help="小專案(給快速自測用)")
+    ap.add_argument("--large", action="store_true", help="大型專案:約 1 萬個專案檔 + 4 萬個 node_modules 檔")
     args = ap.parse_args()
-    sizes = (dict(cpp=10, h=4, json=20, sh=3, py=5, tests=3, md=3) if args.small else
-             dict(cpp=120, h=40, json=400, sh=25, py=60, tests=30, md=40))
+    if args.small:
+        sizes = dict(cpp=10, h=4, json=20, sh=3, py=5, tests=3, md=3)
+    elif args.large:
+        sizes = dict(cpp=2000, h=500, json=6000, sh=100, py=500, tests=100, md=800, node_modules=40000)
+    else:
+        sizes = dict(cpp=120, h=40, json=400, sh=25, py=60, tests=30, md=40)
     revs = [r.strip() for r in args.revs.split(",") if r.strip()]
 
     with tempfile.TemporaryDirectory(prefix="verify-bench-") as tmp:
         tmp = Path(tmp)
         template = tmp / "template"
         make_project(template, sizes)
-        make_fake_pio(tmp / "bin", args.build_seconds)
         env = dict(os.environ)
-        env["PATH"] = f"{tmp / 'bin'}{os.pathsep}{env.get('PATH', '')}"
         env.pop("CLAUDE_VERIFY_DEBUG", None)
         nfiles = sum(1 for p in template.rglob("*") if p.is_file())
         results = {}
@@ -171,10 +207,13 @@ def main():
         "| 情境 | " + " | ".join(revs) + " |",
         "|---|" + "---|" * len(revs),
     ]
-    names = {"cold": "冷啟動(第一次)", "s1": "1. 無變更", "s2": "2. 只改一個 JSON", "s3": "3. 改韌體原始碼"}
-    for tag in ("s1", "s2", "s3", "cold"):
-        lines.append(f"| {names[tag]} | " + " | ".join(fmt(results[r][0][tag]) for r in revs) + " |")
-    probs = [(r, p) for r in revs for p in results[r][1]]
+    names = {"cold": "冷啟動(第一次)", "s1": "暖啟動:無變更", "s2": "只改一個 JSON",
+             "s4": "改一個 Python 原始碼", "s3": "改韌體原始碼", "s5": "工具版本變更(只換 pio)",
+             "s6": "快取失效(刪掉快取/狀態檔)"}
+    for tag in TAGS:
+        lines.append(f"| {names[tag]} | " + " | ".join(fmt(results[r][0][tag], results[r][1][tag])
+                                                       for r in revs) + " |")
+    probs = [(r, p) for r in revs for p in results[r][2]]
     lines.append("")
     if probs:
         lines.append("**有執行被擋下(計時可能不代表正常路徑):**")
