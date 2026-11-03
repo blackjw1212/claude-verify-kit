@@ -469,6 +469,12 @@ NOISE_RE = re.compile(r"\b0 (?:errors?|failed|failures?|problems?)\b", re.I)
 BANNER_RE = re.compile(r"^[=_\-*#~]{3,}\s*|\s*[=_\-*#~]{3,}$")
 HEADER_ONLY_RE = re.compile(r"^(?:errors?|failures?|short test summary info|warnings summary|traceback:?)$", re.I)
 ABS_PATH_RE = re.compile(r"(?:^|[\s(])(?:/|[A-Za-z]:[\\/]|node:)")
+# GCC / Clang 的診斷「檔案:行[:欄]: [fatal ]error: …」是根因本身:路徑在專案外(ESP-IDF、SDK、函式庫標頭)
+# 也一樣重要,不能跟「專案外的堆疊框」一起被降級。
+CC_DIAG_RE = re.compile(r"^\s*(?:[A-Za-z]:)?[^\s:][^:]*:\d+(?::\d+)?:\s*(?:fatal\s+)?error\b", re.I)
+# ninja 的「FAILED: <目標檔>」只說哪個目標壞了,原因在後面的診斷行;排在診斷之後。
+# (pytest 的「FAILED tests/x.py::t」沒有冒號,不受影響。)
+NINJA_FAILED_RE = re.compile(r"^\s*FAILED:\s")
 
 
 def relativize(text, project):
@@ -488,6 +494,10 @@ def _rank(ln):
     has_loc = any(r.search(ln) for r in LOC_RES)
     if TAP_COMMENT_RE.match(ln):
         return 1 if re.match(r"^\s*#\s*(?:fail|failed)\s+[1-9]", ln, re.I) else 4
+    if CC_DIAG_RE.match(ln):
+        return 0
+    if NINJA_FAILED_RE.match(ln):
+        return 2
     if MARKER_RE.match(ln):
         return 0
     if has_loc:
@@ -994,6 +1004,18 @@ def env_sig(prefixes=(), names=()):
     return json.dumps(items, ensure_ascii=False)
 
 
+# 每次呼叫都可能不同、而且不影響建置的殼層變數。漏列的代價只是快取打不中(多驗),不會錯放。
+VOLATILE_ENV = frozenset(("PWD", "OLDPWD", "SHLVL", "_", "COLUMNS", "LINES", "CLAUDE_VERIFY_DEBUG",
+                          "TERM_SESSION_ID", "WINDOWID", "SECURITYSESSIONID", "PROMPT", "PS1"))
+
+
+def env_all_sig():
+    """整份環境的雜湊(排除 VOLATILE_ENV)。只存雜湊:環境變數的值可能是金鑰,不能寫進快取檔。"""
+    items = sorted((k, v) for k, v in os.environ.items() if k not in VOLATILE_ENV)
+    data = json.dumps(items, ensure_ascii=False).encode("utf-8", "surrogateescape")
+    return "envall:" + hashlib.sha256(data).hexdigest()
+
+
 def _read_small(path, limit=4096):
     try:
         return Path(path).read_text(encoding="utf-8", errors="replace")[:limit]
@@ -1121,17 +1143,33 @@ def site_mod():
     return site
 
 
+# 框架原始碼也是建置輸入:只看版本清單的話,就地修改(本機修補 ESP-IDF、改平台的建置腳本)
+# 會沿用舊的通過。Stage 3-2 用真的 ESP-IDF v5.4.4 重現過:改 components/log 的標頭檔 → 舊版放行。
+# 這些目錄走 stat 級的深度簽章(ESP-IDF components/ 約 1.9 萬檔、0.16 秒);超過上限 → 每次都跑。
+def _framework_trees(base, pattern):
+    try:
+        dirs = sorted(p for p in Path(base).glob(pattern) if p.is_dir())
+    except OSError:
+        return "?"
+    return ",".join(f"{d.name}={tree_sig(d)}" for d in dirs)
+
+
 def platformio_sig():
     core = Path(os.environ.get("PLATFORMIO_CORE_DIR") or (_home() / ".platformio"))
     return "pio:" + listing_sig(core / "packages", ("package.json",)) + "|" + \
-        listing_sig(core / "platforms", ("platform.json",))
+        listing_sig(core / "platforms", ("platform.json",)) + "|" + \
+        f"platforms={tree_sig(core / 'platforms')}|" + _framework_trees(core / "packages", "framework-*")
 
 
 def idf_sig():
     idf = os.environ.get("IDF_PATH", "")
     parts = [idf]
     if idf:
-        parts += [path_sig(Path(idf) / "version.txt"), path_sig(Path(idf) / "tools" / "cmake" / "version.cmake")]
+        parts += [path_sig(Path(idf) / "version.txt"), path_sig(Path(idf) / "tools" / "cmake" / "version.cmake"),
+                  f"components={tree_sig(Path(idf) / 'components')}", f"tools={tree_sig(Path(idf) / 'tools')}"]
+    venv = os.environ.get("IDF_PYTHON_ENV_PATH")
+    if venv:   # esp-idf-kconfig、ldgen 的相依、esptool(產生映像檔)都在這個 venv 裡
+        parts.append(python_env(str(Path(venv) / ("Scripts/python.exe" if IS_WIN else "bin/python"))))
     parts += [str(exe_identity(c)) for c in ESP_COMPILERS + ("cmake", "ninja")]
     tools = Path(os.environ.get("IDF_TOOLS_PATH") or (_home() / ".espressif")) / "tools"
     parts.append(listing_sig(tools, depth=2))
@@ -1152,7 +1190,8 @@ def arduino_sig():
     libs = tree_sig(user / "libraries")
     if libs == UNTRACKABLE:
         return UNTRACKABLE
-    return "arduino:" + listing_sig(data / "packages", depth=4) + "|" + libs
+    return "arduino:" + listing_sig(data / "packages", depth=4) + "|" + libs + "|" + \
+        _framework_trees(data / "packages", "*/hardware/*/*")
 
 
 def rust_sig():
@@ -2008,8 +2047,10 @@ def spec_override(ctx, f):
         return dict(vid="override", label=label, run=run, env="",
                     inputs=("always", None, "always:override_cache=false,自訂驗證每次都跑"), cacheable=False)
     py = project_python(ctx.project)
+    # 自訂腳本讀哪些環境變數無從得知(CC、CFLAGS、BUILD_TYPE…):整份環境都算進去。
+    # 舊版只看 PATH → 只改 CC=clang、檔案不動就沿用 gcc 的通過(Stage 3-2 用真的 gcc/clang 重現)。
     env = "|".join([str(exe_identity(cmd[0]))] + [f"{t}={exe_identity(t)}" for t in BROAD_TOOLS] + [
-        env_sig(names=("PATH",)), python_env(py), deps_sig(ctx, "node_modules", "managed_components"),
+        env_all_sig(), python_env(py), deps_sig(ctx, "node_modules", "managed_components"),
         f"libdeps={tree_sig(ctx.project / '.pio' / 'libdeps')}", platformio_sig(), idf_sig(), rust_sig()])
     mode, why = _with_env_mode("any", "any:自訂腳本可能讀取任何檔案(override_cache=true)", env)
     return dict(vid="override", label=label, run=run, inputs=(mode, None, why), env=env, cacheable=True)
