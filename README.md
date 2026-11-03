@@ -83,6 +83,24 @@ Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":
 - **逾時**：預設也擋——逾時代表沒驗完，絕不算通過。只有在 `.claude/verify.json` 明確設 `"on_timeout": "warn"`（全域或 `validators.<id>`）才改成只警告。逾時的工具、指令、執行秒數、上限、成因（驗證器上限／整體預算）與處置（已終止程序樹／未執行）記在 `.claude/.verify.log`，並標為疑點。
 - **工具不存在**：預設只警告（`systemMessage` 讓使用者看得到），`"on_missing": "block"` 可改成擋。注意：自訂驗證 `.claude/verify.sh` 的直譯器（`sh`）不存在時，整份 DoD 都沒跑；要嚴格請設 `validators.override.on_missing: "block"`。
 
+## 只驗變更的部分、快取、平行
+
+- **變更怎麼判定**：比對檔案內容雜湊（存在 `.claude/.verify_cache.json`），不是 transcript 也不是 git。transcript 看不到 Bash 改的檔（`sed -i`、腳本、`git checkout`），官方文件也說它在 Stop 當下可能還沒寫完；git status 列的是所有未 commit 的變更而非這一輪的，也看不到被 `.gitignore` 排除、但驗證器照樣會檢查的檔案。只 `touch`、內容沒變不算變更。
+- **逐檔驗證器**（JSON、XML、plist、ACPI、xlsx、shellcheck、Python 語法）：只驗內容變了的檔案，其餘沿用上次的結果——**包括上次的失敗**，沒修好的檔照樣擋。快取鍵 = 檔案內容雜湊 + 驗證器版本 + 工具識別（路徑、大小、mtime；shellcheck 另含 `.shellcheckrc`）。
+- **專案層級驗證器**（建置、測試、自訂驗證）：它的輸入變了才重跑，**只快取通過**（失敗可能是環境問題，裝好套件後檔案沒變也必須重跑）。
+  - 韌體：原始碼、標頭、建置設定、`EMBED_FILES`／`board_build.embed_*` 宣告的檔案。遇到 `file(GLOB)`、`configure_file`、PlatformIO `extra_scripts`、含變數的嵌入路徑等看不出輸入的寫法，就改成任何變更都重建；任何檔案被刪除也重建。
+  - pytest、npm、cargo、aglint、`.claude/verify*`：任何檔案變更都重跑（它們可能讀任何檔案）。
+- **平行**：彼此獨立的驗證器同時跑，最多 `max_parallel` 個（預設 min(4, CPU 數)），其中重型（韌體、測試、Node、Rust、自訂驗證）最多 `max_heavy` 個（預設 1），避免韌體建置吃滿 CPU。`max_parallel: 1` = 完全依序。
+- **已知限制**：內容改了、但大小與 mtime 都被刻意還原成很久以前的時間（例如 `cp -p` 一個同大小的舊檔），預設模式看不到（與 git index 相同）。要嚴格請設 `"trust_mtime": false`（每次重讀全部檔案）。工具以外的環境變化（例如 `pip install` 進全域 Python）不在快取鍵裡；venv 的 site-packages、`node_modules`、`.pio/libdeps`、`managed_components` 的異動有算進去。
+- **相關設定**（`.claude/verify.json`）：`max_parallel`、`max_heavy`、`cache`（false = 每次全驗）、`override_cache`（false = 自訂驗證每次都跑，即 Stage 1 行為）、`trust_mtime`、`debug`（或環境變數 `CLAUDE_VERIFY_DEBUG=1`：把每個驗證器為什麼跑、為什麼沿用寫進 `.claude/.verify.log`）。
+- **效能**：`python3 bench/benchmark.py` 量三種情境（無變更／只改一個 JSON／改韌體原始碼），見下表（合成專案 719 個檔案，韌體建置以固定 3 秒的假 `pio` 代替，CPU 4 核）：
+
+| 情境 | 原版 bf696de | Stage 1 | Stage 2 |
+|---|---|---|---|
+| 無變更 | 0.05 s | 0.06 s | 0.07 s |
+| 只改一個 JSON | 7.43 s | 3.85 s | 0.70 s |
+| 改韌體原始碼 | 7.34 s | 3.90 s | 3.81 s |
+
 ## Cross-Model 計劃審查（Claude ↔ Codex）
 
 第二個、與上面**職責不同**的 Stop hook 閘門:`verify.py` 審「完成的程式碼能否編譯/測試」（交付前），`plan-review.py` 審「**實作計劃的邏輯漏洞**」（動手前）。讓創意的 Claude 主寫、讓穩定的 Codex 當無情 Reviewer。

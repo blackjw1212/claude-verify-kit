@@ -14,6 +14,17 @@ AdGuard、xlsx、shell、Python、Node、Rust)。
   3) .claude/verify(.sh/.py/.cmd/.bat)  → 只跑它,exit code 即裁決。
   4) 否則                                → 跑所有「適用」的內建檢查並聚合結果。
 
+只驗變更的部分(Stage 2):
+  - 變更以「檔案內容雜湊」判定(.claude/.verify_cache.json),不看 transcript 或 git:
+    前者看不到 Bash 改的檔、後者看不到 .gitignore 掉但仍要驗的檔。只 touch 不算變更。
+  - 逐檔驗證器(JSON/XML/plist/ACPI/xlsx/shellcheck/Python 語法)只驗內容變了的檔案,
+    其餘沿用上次的結果 —— 包括上次的失敗(沒修好的檔照樣擋)。
+  - 專案層級驗證器(建置/測試/自訂驗證)在「它的輸入」變了才重跑,只快取通過:
+      韌體  原始碼/標頭/建置設定/宣告嵌入的檔案;遇到 file(GLOB)、extra_scripts 等
+            看不出輸入的寫法就改成任何變更都重建;任何檔案被刪除也重建
+      測試、Node、Rust、aglint、自訂驗證  任何檔案變更都重跑(它們可能讀任何檔)
+  - 彼此獨立的驗證器平行執行:最多 max_parallel 個,其中重型最多 max_heavy 個。
+
 每個結果是四種狀態之一,處置不同(.claude/verify.json 可調):
   fail     真正的驗證失敗           → 擋下
   missing  工具不存在               → 預設只警告(on_missing: warn|block|ignore)
@@ -49,6 +60,7 @@ import sys
 import tempfile
 import time
 import xml.parsers.expat
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 VERSION = "3.0.0-dev.1"
@@ -99,6 +111,12 @@ DEFAULT_CONFIG = {
     "max_consecutive_blocks": 5,    # 同一輪連續擋幾次後放行;0 = 只靠 Claude Code 的上限
     "on_missing": "warn",           # warn | block | ignore
     "on_timeout": "block",          # block | warn | ignore — 逾時不算通過,預設擋
+    "max_parallel": min(4, os.cpu_count() or 1),  # 同時跑幾個驗證器;1 = 完全依序
+    "max_heavy": 1,                 # 其中重型(韌體建置、測試)最多幾個
+    "cache": True,                  # False = 每次都驗全部(不沿用快取結果)
+    "override_cache": True,         # False = 自訂驗證每次都跑(Stage 1 行為)
+    "trust_mtime": True,            # False = 每次重新雜湊所有檔案(最慢、最保守)
+    "debug": False,                 # 或環境變數 CLAUDE_VERIFY_DEBUG=1:把跳過/沿用的理由寫進紀錄
     "validators": {},               # {"<id>": {"timeout": 秒, "on_missing": ..., "on_timeout": ...}}
 }
 
@@ -109,6 +127,11 @@ DEFAULT_TIMEOUTS = {
     "opencore": 60, "acpi": 60, "xml": 60, "json": 60,
 }
 POLICIES = ("warn", "block", "ignore")
+BOOL_KEYS = ("rerun_when_active", "cache", "override_cache", "trust_mtime", "debug")
+
+
+def is_debug(cfg):
+    return bool(cfg.get("debug")) or os.environ.get("CLAUDE_VERIFY_DEBUG", "") not in ("", "0")
 
 
 # ---------------------------------------------------------------- 小工具
@@ -196,7 +219,7 @@ def load_config(project, notes):
             if val not in ("json", "exit2"):
                 bad(key, "必須是 json / exit2")
                 continue
-        elif key == "rerun_when_active":
+        elif key in BOOL_KEYS:
             if not isinstance(val, bool):
                 bad(key, "必須是 true / false")
                 continue
@@ -220,8 +243,8 @@ def load_config(project, notes):
                 clean[vid] = o
             val = clean
         else:  # 數值
-            minimum = {"max_lines": 1, "max_reason_chars": 500,
-                       "budget_seconds": 1, "max_consecutive_blocks": 0}[key]
+            minimum = {"max_lines": 1, "max_reason_chars": 500, "budget_seconds": 1,
+                       "max_consecutive_blocks": 0, "max_parallel": 1, "max_heavy": 1}[key]
             if isinstance(val, bool) or not isinstance(val, (int, float)) or val < minimum:
                 bad(key, f"必須是 ≥ {minimum} 的數字")
                 continue
@@ -512,6 +535,18 @@ class Ctx:
         self.cfg = cfg
         self.deadline = t0 + float(cfg["budget_seconds"])
         self._files = None
+        self._manifest = None
+        self.debug = is_debug(cfg)
+
+    @property
+    def manifest(self):
+        if self._manifest is None:  # 沒有上次紀錄 → 全部視為新檔(只在直接呼叫檢查函式時發生)
+            self._manifest = Manifest(self.project).scan(self.files() + claude_extras(self.project))
+        return self._manifest
+
+    @manifest.setter
+    def manifest(self, value):
+        self._manifest = value
 
     # ---- 時間預算
     def remaining(self):
@@ -530,9 +565,12 @@ class Ctx:
     def reset_files(self):
         self._files = None
 
-    def glob(self, *patterns):
-        return [self.project / rel for rel in self.files()
+    def glob_rel(self, *patterns):
+        return [rel for rel in self.files()
                 if any(fnmatch.fnmatch(rel.rsplit("/", 1)[-1], p) for p in patterns)]
+
+    def glob(self, *patterns):
+        return [self.project / rel for rel in self.glob_rel(*patterns)]
 
     def rel(self, path):
         try:
@@ -546,25 +584,31 @@ class Ctx:
             return "budget_exhausted"
         return "budget_limited" if limit < float(vopt(self.cfg, vid, "timeout")) else "validator_timeout"
 
-    def tool(self, vid, label, argv, cwd=None, env=None, stdin_bytes=None,
-             fail_detect=None):
-        timeout = self.timeout_for(vid)
-        status, rc, text, dur = run_tool(argv, str(cwd or self.project), timeout,
+    def tool_raw(self, vid, argv, cwd=None, env=None, stdin_bytes=None):
+        """→ (status, rc, 原始輸出, 秒數, 本次上限)。給需要自己解析輸出的逐檔驗證器用。"""
+        limit = self.timeout_for(vid)
+        status, rc, text, dur = run_tool(argv, str(cwd or self.project), limit,
                                          env=env, stdin_bytes=stdin_bytes)
-        # fail_detect 只能在「跑完了」的兩種結果之間改判;逾時/缺工具/錯誤不可能被改成通過。
-        if status in ("ok", "fail") and fail_detect is not None:
-            status = "fail" if fail_detect(rc, text) else "ok"
-        max_lines = self.cfg["max_lines"]
+        return status, rc, text, dur, limit
+
+    def result_from(self, vid, label, status, rc, text, dur, limit, argv):
         if status == "ok":
             return Result(vid, label, "pass", rc=rc, duration=dur)
         if status == "fail":
-            return Result(vid, label, "fail", summarize(text, max_lines, self.project), rc, dur)
+            return Result(vid, label, "fail", summarize(text, self.cfg["max_lines"], self.project), rc, dur)
         if status == "missing":
             return Result(vid, label, "missing", [f"{text}(不在 PATH)"], duration=dur)
         if status == "timeout":
-            return timeout_result(vid, label, timeout, dur, self.budget_cause(vid, timeout),
-                                  _display_cmd(argv))
+            return timeout_result(vid, label, limit, dur, self.budget_cause(vid, limit), _display_cmd(argv))
         return Result(vid, label, "error", [clip(text, 220)], duration=dur)
+
+    def tool(self, vid, label, argv, cwd=None, env=None, stdin_bytes=None,
+             fail_detect=None):
+        status, rc, text, dur, limit = self.tool_raw(vid, argv, cwd, env, stdin_bytes)
+        # fail_detect 只能在「跑完了」的兩種結果之間改判;逾時/缺工具/錯誤不可能被改成通過。
+        if status in ("ok", "fail") and fail_detect is not None:
+            status = "fail" if fail_detect(rc, text) else "ok"
+        return self.result_from(vid, label, status, rc, text, dur, limit, argv)
 
     def budget_stop(self, vid, label, t0):
         """程序內的檢查(JSON/XML/xlsx)在檔案之間發現預算用盡。"""
@@ -588,146 +632,292 @@ def walk_files(project):
     return out
 
 
-def fingerprint(project, files):
-    """專案狀態指紋:檔案清單 + 大小 + mtime。
-
-    舊版用「有沒有檔案比 marker 新」判斷變更,刪檔完全看不到(刪掉被 import 的模組
-    後照樣放行)。指紋把清單本身算進去,增、刪、改都會變。
-    .claude/ 只納入頂層的非隱藏檔與 hooks/(設定與自訂驗證腳本改了要重驗),
-    隱藏的狀態檔(本 hook 與 loop-gate 寫的)不納入,否則寫狀態就會改變指紋。
-    """
-    entries = list(files)
+def claude_extras(project):
+    """.claude/ 只納入頂層的非隱藏檔與 hooks/(設定與自訂驗證腳本改了要重驗)。
+    隱藏的狀態檔(本 hook 與 loop-gate 寫的)不納入,否則寫狀態就會被當成變更。"""
+    out = []
     cdir = project / ".claude"
-    if cdir.is_dir():
-        try:
+    try:
+        if cdir.is_dir():
             for p in sorted(cdir.iterdir()):
                 if p.is_file() and not p.name.startswith("."):
-                    entries.append(".claude/" + p.name)
+                    out.append(".claude/" + p.name)
             hooks = cdir / "hooks"
             if hooks.is_dir():
                 for p in sorted(hooks.iterdir()):
                     if p.is_file() and not p.name.startswith("."):
-                        entries.append(".claude/hooks/" + p.name)
-        except OSError:
-            pass
-    h = hashlib.sha256(VERSION.encode())
-    for rel in entries:
-        try:
-            st = os.stat(project / rel)
-            h.update(f"{rel}\0{st.st_size}\0{st.st_mtime_ns}\n".encode("utf-8", "surrogateescape"))
-        except OSError:
-            h.update(f"{rel}\0gone\n".encode("utf-8", "surrogateescape"))
-    return h.hexdigest()
-
-
-# ---------------------------------------------------------------- 內建檢查
-# 每個檢查回傳 list[Result];不適用回傳 []。
-
-
-def check_firmware(ctx):
-    pr = ctx.project
-    if (pr / "platformio.ini").exists():
-        cmd, label = ["pio", "run"], "PlatformIO 建置"
-    elif (pr / "CMakeLists.txt").exists() and (
-            (pr / "sdkconfig").exists() or (pr / "sdkconfig.defaults").exists()
-            or (pr / "main" / "idf_component.yml").exists()):
-        cmd, label = ["idf.py", "build"], "ESP-IDF 建置"
-    elif (pr / "sketch.yaml").exists():
-        prof = pr / ".claude" / "arduino-profile"
-        p = prof.read_text(encoding="utf-8").strip() if prof.exists() else "default"
-        cmd, label = ["arduino-cli", "compile", "--profile", p], "arduino-cli 編譯"
-    else:
-        inos = ctx.glob("*.ino")
-        fqbn = pr / ".claude" / "fqbn"
-        if not (inos and fqbn.exists()):
-            return []
-        cmd = ["arduino-cli", "compile", "-b", fqbn.read_text(encoding="utf-8").strip(),
-               str(inos[0].parent)]
-        label = "arduino-cli 編譯"
-    return [ctx.tool("firmware", label, cmd)]
-
-
-def _per_file(ctx, vid, label, files, argv_for, cwd_for=None):
-    """同一個工具逐檔執行,聚合結果。
-
-    中途遇到缺工具/逾時/錯誤就停,但**已找到的失敗要保留**(舊版會整個丟掉,
-    只回報逾時,模型看不到其實已經確定壞掉的檔案)。回傳 list[Result]。
-    """
-    fails, worst, total = [], None, 0.0
-    stop = None
-    for f in files:
-        r = ctx.tool(vid, label, argv_for(f), cwd=cwd_for(f) if cwd_for else None)
-        total += r.duration
-        if r.status in ("missing", "timeout", "error"):
-            stop = r
-            break
-        if r.status == "fail":
-            fails.append(f"{ctx.rel(f)}:")
-            fails.extend("  " + ln for ln in r.lines)
-            worst = r.rc
-    out = []
-    if fails:
-        out.append(Result(vid, label, "fail", fails, worst, total))
-    if stop is not None:
-        stop.duration = total
-        out.append(stop)
-    return out or [Result(vid, label, "pass", duration=total)]
-
-
-def check_plist(ctx):
-    files = ctx.glob("*.plist")
-    if not files:
-        return []
-    out = _per_file(ctx, "plist", "plist 語法(plutil)", files,
-                    lambda f: ["plutil", "-lint", str(f)])
-    oc = next((p for p in files if p.name == "config.plist"), None)
-    if oc is not None:
-        r = ctx.tool("opencore", "OpenCore 語意(ocvalidate)", ["ocvalidate", str(oc)])
-        if r.status == "fail":
-            r.lines.append("注意:ocvalidate 版本須對應你的 OpenCore release")
-        out.append(r)
+                        out.append(".claude/hooks/" + p.name)
+    except OSError:
+        pass
     return out
 
 
-def check_acpi(ctx):
-    files = ctx.glob("*.dsl")
-    if not files:
-        return []
-    return _per_file(ctx, "acpi", "ACPI/SSDT(iasl)", files,
-                     lambda f: ["iasl", str(f)], cwd_for=lambda f: f.parent)
+# ---------------------------------------------------------------- 變更偵測:內容雜湊清單
+#
+# 變更的唯一依據是「檔案內容」,不是 transcript、也不是 git:
+#   - transcript 看不到 Bash 改的檔(sed -i、腳本、git checkout),官方文件也說它在 Stop
+#     當下可能還沒寫完 → 拿它當來源會漏擋。
+#   - git status 列的是「所有未 commit 的變更」而非這一輪的,且看不到被 .gitignore 排除、
+#     但驗證器照樣會檢查的檔案 → 一樣會漏。
+# 內容雜湊兩者都不會漏:誰改的、怎麼改的都一樣。stat(大小+mtime)沒變的檔案沿用上次的
+# 雜湊,不重讀(同 git index);但「上次觀察時才剛被改過」(racy,2 秒內)的一律重讀。
+
+CACHE_NAME = ".verify_cache.json"
+CACHE_FORMAT = 1
+BIG_FILE = 64 * 1024 * 1024     # 超過就不讀內容,只比大小與 mtime
+RACY_NS = 2 * 10 ** 9
+
+# 驗證器邏輯版本:改了某個驗證器的判定方式就 +1,它的舊快取自動失效。
+VALIDATOR_VERSIONS = {
+    "firmware": 1, "plist": 1, "opencore": 1, "acpi": 1, "xml": 1, "json": 1,
+    "adblock": 1, "xlsx": 1, "shell": 1, "python": 1, "pytest": 1, "node": 1,
+    "rust": 1, "override": 1,
+}
+# 重型:會吃滿 CPU 的建置/測試,同時最多跑 max_heavy 個(預設 1),避免互搶到逾時。
+HEAVY = {"firmware", "rust", "node", "pytest", "override"}
 
 
-def _collect(vid, label, fails, ctx, t0, stopped=False):
-    """程序內檢查的結果。stopped=True:預算中途用盡 → 已找到的失敗 + 一筆 timeout。"""
-    dur = time.monotonic() - t0
+def _hash_file(path, size, mtime_ns):
+    if size > BIG_FILE:
+        return f"stat:{size}:{mtime_ns}"
+    h = hashlib.blake2b(digest_size=16)
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError:
+        return f"unreadable:{size}:{mtime_ns}"
+    return h.hexdigest()
+
+
+class Manifest:
+    """每個檔案的 [大小, mtime_ns, 觀察時間_ns, 內容雜湊]。"""
+
+    def __init__(self, project, prev=None, trust_mtime=True):
+        self.project = project
+        self.prev = prev if isinstance(prev, dict) else {}
+        self.trust = trust_mtime
+        self.entries = {}
+        self.added, self.modified, self.deleted = [], [], []
+        self.hashed = 0
+
+    def scan(self, rels):
+        now = time.time_ns()
+        entries, added, modified = {}, [], []
+        for rel in rels:
+            path = self.project / rel
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            size, mt = st.st_size, st.st_mtime_ns
+            old = self.prev.get(rel)
+            valid_old = isinstance(old, list) and len(old) == 4
+            if (self.trust and valid_old and old[0] == size and old[1] == mt and old[3]
+                    and (old[2] - old[1]) >= RACY_NS):
+                h = old[3]
+            else:
+                h = _hash_file(path, size, mt)
+                self.hashed += 1
+            entries[rel] = [size, mt, now, h]
+            if not valid_old:
+                added.append(rel)
+            elif old[3] != h:
+                modified.append(rel)
+        self.entries = entries
+        self.added, self.modified = added, modified
+        self.deleted = sorted(r for r in self.prev if r not in entries)
+        return self
+
+    def hash_of(self, rel):
+        e = self.entries.get(rel)
+        return e[3] if e else None
+
+    def digest(self, rels=None):
+        h = hashlib.sha256(VERSION.encode())
+        names = sorted(self.entries) if rels is None else sorted(rels)
+        for rel in names:
+            e = self.entries.get(rel)
+            h.update(f"{rel}\0{e[3] if e else '-'}\n".encode("utf-8", "surrogateescape"))
+        return h.hexdigest()
+
+    def changes(self, limit=20):
+        return {"added": len(self.added), "modified": len(self.modified),
+                "deleted": len(self.deleted), "hashed": self.hashed,
+                "sample": (self.modified + self.added + self.deleted)[:limit]}
+
+
+def fingerprint(manifest):
+    """專案狀態指紋 = 全部檔案的(路徑, 內容雜湊)。增、刪、改都會變;只 touch 不會。"""
+    return manifest.digest()
+
+
+def load_cache(project):
+    empty = {"manifest": {}, "results": {}}
+    try:
+        c = json.loads((project / ".claude" / CACHE_NAME).read_text(encoding="utf-8"))
+    except Exception:
+        return empty
+    if not isinstance(c, dict) or c.get("format") != CACHE_FORMAT:
+        return empty
+    man = c.get("manifest") if isinstance(c.get("manifest"), dict) else {}
+    # kit 版本變了 → 驗證結果全部作廢(判定邏輯可能不同);檔案雜湊仍可沿用。
+    res = c.get("results") if c.get("kit") == VERSION and isinstance(c.get("results"), dict) else {}
+    return {"manifest": man, "results": res}
+
+
+def save_cache(project, manifest, results):
+    path = project / ".claude" / CACHE_NAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"format": CACHE_FORMAT, "kit": VERSION,
+                                   "manifest": manifest.entries, "results": results},
+                                  ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except OSError as e:
+        warn(f"無法寫入快取:{e}")
+
+
+# ---------------------------------------------------------------- 工具與環境識別(快取鍵的一部分)
+
+def exe_identity(name):
+    """工具的實際路徑 + 大小 + mtime:升級工具 → 識別改變 → 舊結果作廢。找不到回 None。"""
+    name = str(name)
+    has_sep = ("/" in name) or ("\\" in name)
+    path = name if (has_sep and os.path.isfile(name)) else (None if has_sep else shutil.which(name))
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+        return f"{path}|{st.st_size}|{st.st_mtime_ns}"
+    except OSError:
+        return path
+
+
+def path_sig(path):
+    try:
+        st = os.stat(path)
+        return f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        return "-"
+
+
+def env_sig(prefixes=(), names=()):
+    items = sorted((k, v) for k, v in os.environ.items()
+                   if k in names or any(k.startswith(p) for p in prefixes))
+    return json.dumps(items, ensure_ascii=False)
+
+
+def _read_small(path, limit=4096):
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:limit]
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------- 逐檔驗證器的共用件
+# runner(ctx, rels) → (outcomes, extras)
+#   outcomes: {rel: ("pass"|"fail", [lines])}  只有「確定歸屬到某個檔案」的結果才進快取
+#   extras:   [Result]  缺工具/逾時/錯誤/無法歸屬到檔案的失敗 —— 永遠不進快取
+
+LOC_PREFIX_RE = re.compile(r"^(.+?):(\d+):")
+
+
+def attribute_lines(text, rels, project, per_file=20):
+    """把工具輸出的每一行歸給它開頭寫的那個檔案。回傳 ({rel: [lines]}, 無法歸屬的行數)。"""
+    text = relativize(ANSI_RE.sub("", text or ""), project).replace("\r\n", "\n")
+    wanted = set(rels)
+    by, stray = {}, 0
+    for ln in text.split("\n"):
+        if not ln.strip():
+            continue
+        m = LOC_PREFIX_RE.match(ln)
+        cand = m.group(1).replace("\\", "/") if m else None
+        if cand in wanted:
+            lst = by.setdefault(cand, [])
+            if len(lst) < per_file:
+                lst.append(clip(ln.rstrip(), 220))
+        else:
+            stray += 1
+    return by, stray
+
+
+def file_results(ctx, vid, label, targets, outcomes, extras, duration=0.0, meta=None):
+    lines, nfail = [], 0
+    for rel in targets:
+        o = outcomes.get(rel)
+        if o and o[0] == "fail":
+            nfail += 1
+            lines.extend(o[1])
     out = []
-    if fails:
-        n = ctx.cfg["max_lines"]
-        lines = fails[:n] + ([f"…另 {len(fails) - n} 個檔案省略"] if len(fails) > n else [])
-        out.append(Result(vid, label, "fail", lines, duration=dur))
-    if stopped:
-        out.append(ctx.budget_stop(vid, label, t0))
-    return out or [Result(vid, label, "pass", duration=dur)]
+    n = ctx.cfg["max_lines"]
+    if nfail:
+        shown = lines[:n] + ([f"…另 {len(lines) - n} 行省略"] if len(lines) > n else [])
+        out.append(Result(vid, label, "fail", shown, duration=duration, meta=dict(meta or {})))
+    out.extend(extras)
+    if not out:
+        out.append(Result(vid, label, "pass", duration=duration, meta=dict(meta or {})))
+    return out
 
 
-def check_xml(ctx):
-    files = ctx.glob("*.xml")
-    if not files:
-        return []
+def _per_file_outcomes(ctx, vid, label, rels, argv_for, cwd_for=None):
+    """同一個工具逐檔執行。中途遇到缺工具/逾時/錯誤就停,但已找到的失敗要保留。"""
+    outcomes = {}
+    for rel in rels:
+        path = ctx.project / rel
+        r = ctx.tool(vid, label, argv_for(path), cwd=cwd_for(path) if cwd_for else None)
+        if r.status in ("missing", "timeout", "error"):
+            return outcomes, [r]
+        if r.status == "fail":
+            outcomes[rel] = ("fail", [f"{rel}:"] + ["  " + ln for ln in r.lines])
+        else:
+            outcomes[rel] = ("pass", [])
+    return outcomes, []
+
+
+def _per_file(ctx, vid, label, files, argv_for, cwd_for=None):
+    """(Stage 1 介面)逐檔執行並聚合成 list[Result]。"""
+    rels = [ctx.rel(f) for f in files]
     t0 = time.monotonic()
-    fails = []
-    for f in files:
+    outcomes, extras = _per_file_outcomes(ctx, vid, label, rels, argv_for, cwd_for)
+    total = time.monotonic() - t0
+    for r in extras:
+        r.duration = total
+    return file_results(ctx, vid, label, rels, outcomes, extras, total)
+
+
+# ---------------------------------------------------------------- 逐檔驗證器
+
+
+def run_plist(ctx, rels):
+    return _per_file_outcomes(ctx, "plist", "plist 語法(plutil)", rels,
+                              lambda f: ["plutil", "-lint", str(f)])
+
+
+def run_acpi(ctx, rels):
+    return _per_file_outcomes(ctx, "acpi", "ACPI/SSDT(iasl)", rels,
+                              lambda f: ["iasl", str(f)], cwd_for=lambda f: f.parent)
+
+
+def run_xml(ctx, rels):
+    outcomes, t0 = {}, time.monotonic()
+    for rel in rels:
         if ctx.remaining() < 3:
-            return _collect("xml", "XML 格式", fails, ctx, t0, stopped=True)
+            return outcomes, [ctx.budget_stop("xml", "XML 格式", t0)]
         parser = xml.parsers.expat.ParserCreate()
         try:
-            with open(f, "rb") as fh:
+            with open(ctx.project / rel, "rb") as fh:
                 parser.ParseFile(fh)
+            outcomes[rel] = ("pass", [])
         except xml.parsers.expat.ExpatError as e:
-            fails.append(f"{ctx.rel(f)}:{e.lineno}:{e.offset}: {xml.parsers.expat.ErrorString(e.code)}")
+            outcomes[rel] = ("fail", [f"{rel}:{e.lineno}:{e.offset}: {xml.parsers.expat.ErrorString(e.code)}"])
         except OSError as e:
-            fails.append(f"{ctx.rel(f)}: 無法讀取({e})")
-    return _collect("xml", "XML 格式", fails, ctx, t0)
+            outcomes[rel] = ("fail", [f"{rel}: 無法讀取({e})"])
+    return outcomes, []
 
 
 def strip_jsonc(text):
@@ -764,90 +954,84 @@ def strip_jsonc(text):
     return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
 
 
-def check_json(ctx):
-    files = ctx.glob("*.json")
-    if not files:
-        return []
-    t0 = time.monotonic()
-    fails = []
-    for f in files:
-        if ctx.remaining() < 3:
-            return _collect("json", "JSON 格式", fails, ctx, t0, stopped=True)
-        try:
-            # utf-8-sig 容忍 UTF-8 BOM(Windows 編輯器常見)。
-            text = f.read_text(encoding="utf-8-sig")
-        except (OSError, UnicodeDecodeError) as e:
-            fails.append(f"{ctx.rel(f)}: 無法以 UTF-8 讀取({e})")
-            continue
-        try:
-            json.loads(text)
-            continue
-        except json.JSONDecodeError as e:
-            err = e
-        if any(fnmatch.fnmatch(f.name, p) for p in JSONC_NAMES):
-            try:
-                json.loads(strip_jsonc(text))
-                continue
-            except json.JSONDecodeError as e2:
-                err = e2
-        fails.append(f"{ctx.rel(f)}:{err.lineno}:{err.colno}: {err.msg}")
-    return _collect("json", "JSON 格式", fails, ctx, t0)
-
-
-def check_adblock(ctx):
-    cfg = ctx.glob(".aglintrc", ".aglintrc.yaml", ".aglintrc.yml", ".aglintrc.json")
-    if not cfg:
-        return []
-    runner = ["aglint"] if shutil.which("aglint") else ["npx", "--no-install", "aglint"]
-
-    # 保險:AGLint 的 exit code 規格未經官方確認,部分 linter 即使有錯仍回 0,
-    # 故同時偵測輸出中的 error token(格式如 "12:0  error  ..."),避免漏接。
-    def failed(rc, text):
-        return rc != 0 or bool(re.search(r"\d+:\d+\s+error\b", text))
-    return [ctx.tool("adblock", "AdGuard 規則(aglint)", runner, fail_detect=failed)]
-
-
-def check_xlsx(ctx):
-    files = ctx.glob("*.xlsx")
-    if not files:
-        return []
+def _json_one(path, rel):
     try:
-        import openpyxl  # noqa: PLC0415
-    except Exception:
-        return [Result("xlsx", "Excel xlsx", "missing", ["openpyxl 未安裝(pip install openpyxl)"])]
-    t0 = time.monotonic()
-    fails = []
-    for f in files:
-        if ctx.remaining() < 3:
-            return _collect("xlsx", "Excel xlsx", fails, ctx, t0, stopped=True)
+        # utf-8-sig 容忍 UTF-8 BOM(Windows 編輯器常見)。
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as e:
+        return ("fail", [f"{rel}: 無法以 UTF-8 讀取({e})"])
+    try:
+        json.loads(text)
+        return ("pass", [])
+    except json.JSONDecodeError as e:
+        err = e
+    if any(fnmatch.fnmatch(path.name, p) for p in JSONC_NAMES):
         try:
-            openpyxl.load_workbook(str(f))
+            json.loads(strip_jsonc(text))
+            return ("pass", [])
+        except json.JSONDecodeError as e2:
+            err = e2
+    return ("fail", [f"{rel}:{err.lineno}:{err.colno}: {err.msg}"])
+
+
+def run_json(ctx, rels):
+    outcomes, t0 = {}, time.monotonic()
+    for rel in rels:
+        if ctx.remaining() < 3:
+            return outcomes, [ctx.budget_stop("json", "JSON 格式", t0)]
+        outcomes[rel] = _json_one(ctx.project / rel, rel)
+    return outcomes, []
+
+
+def run_xlsx(ctx, rels):
+    import openpyxl  # noqa: PLC0415  —— 能走到這裡代表工具識別時已確認可 import
+    outcomes, t0 = {}, time.monotonic()
+    for rel in rels:
+        if ctx.remaining() < 3:
+            return outcomes, [ctx.budget_stop("xlsx", "Excel xlsx", t0)]
+        try:
+            openpyxl.load_workbook(str(ctx.project / rel))
+            outcomes[rel] = ("pass", [])
         except Exception as e:
-            fails.append(f"{ctx.rel(f)}: 損毀/無法載入({clip(str(e), 160)})")
-    return _collect("xlsx", "Excel xlsx", fails, ctx, t0)
+            outcomes[rel] = ("fail", [f"{rel}: 損毀/無法載入({clip(str(e), 160)})"])
+    return outcomes, []
 
 
-def check_shell(ctx):
-    files = ctx.glob("*.sh")
-    if not files:
-        return []
-    # -f gcc:每個問題一行 file:line:col: severity: msg [SCxxxx],最好摘要。
-    return [ctx.tool("shell", "shellcheck", ["shellcheck", "-f", "gcc"] + [str(p) for p in files])]
+def _chunks(rels, project, max_chars=6000):
+    """命令列長度有上限(Windows 約 32K 字元),檔案多時分批。"""
+    batch, size = [], 0
+    for rel in rels:
+        n = len(str(project / rel)) + 3
+        if batch and size + n > max_chars:
+            yield batch
+            batch, size = [], 0
+        batch.append(rel)
+        size += n
+    if batch:
+        yield batch
 
 
-def project_python(project):
-    """專案 venv 的直譯器優先;沒有才退回跑這支 hook 的 Python。
-
-    用全域 pytest 跑有 venv 的專案,會看不到專案自己的套件而噴
-    ModuleNotFoundError —— 那是假陰性、不是真失敗(實測同一專案:
-    全域 8 errors vs venv 105 passed)。
-    """
-    for vdir in (".venv", "venv"):
-        for sub, exe in (("Scripts", "python.exe"), ("bin", "python")):
-            p = project / vdir / sub / exe
-            if p.exists():
-                return str(p)
-    return sys.executable
+def run_shell(ctx, rels):
+    outcomes, extras = {}, []
+    label = "shellcheck"
+    for batch in _chunks(rels, ctx.project):
+        # -f gcc:每個問題一行 file:line:col: severity: msg [SCxxxx],可以準確歸屬到檔案。
+        argv = ["shellcheck", "-f", "gcc"] + [str(ctx.project / r) for r in batch]
+        st, rc, text, dur, limit = ctx.tool_raw("shell", argv)
+        if st == "ok":
+            outcomes.update((r, ("pass", [])) for r in batch)
+            continue
+        if st != "fail":
+            extras.append(ctx.result_from("shell", label, st, rc, text, dur, limit, argv))
+            break
+        by, stray = attribute_lines(text, batch, ctx.project)
+        if rc == 1 and by:  # 1 = 有問題;2 以上 = shellcheck 自己出錯
+            for r in batch:
+                outcomes[r] = ("fail", by[r]) if r in by else ("pass", [])
+        else:
+            extras.append(Result("shell", label, "fail", summarize(text, ctx.cfg["max_lines"], ctx.project),
+                                 rc, dur))
+    return outcomes, extras
 
 
 # 在「專案的」直譯器裡一次編譯全部檔案:語法以專案的 Python 版本為準,
@@ -872,18 +1056,273 @@ sys.exit(1 if bad else 0)
 """
 
 
-def check_python(ctx):
-    files = ctx.glob("*.py")
-    if not files:
-        return []
+def project_python(project):
+    """專案 venv 的直譯器優先;沒有才退回跑這支 hook 的 Python。
+
+    用全域 pytest 跑有 venv 的專案,會看不到專案自己的套件而噴
+    ModuleNotFoundError —— 那是假陰性、不是真失敗(實測同一專案:
+    全域 8 errors vs venv 105 passed)。
+    """
+    for vdir in (".venv", "venv"):
+        for sub, exe in (("Scripts", "python.exe"), ("bin", "python")):
+            p = project / vdir / sub / exe
+            if p.exists():
+                return str(p)
+    return sys.executable
+
+
+def run_python_syntax(ctx, rels):
     py = project_python(ctx.project)
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
-    payload = "\0".join(str(f) for f in files).encode("utf-8", "surrogateescape")
-    out = [ctx.tool("python", "Python 語法", [py, "-c", _SYNTAX_SCRIPT], env=env,
-                    stdin_bytes=payload)]
-    has_tests = bool(ctx.glob("test_*.py", "*_test.py")) or (ctx.project / "tests").is_dir()
-    if not has_tests:
-        return out
+    payload = "\0".join(str(ctx.project / r) for r in rels).encode("utf-8", "surrogateescape")
+    argv = [py, "-c", _SYNTAX_SCRIPT]
+    st, rc, text, dur, limit = ctx.tool_raw("python", argv, env=env, stdin_bytes=payload)
+    if st == "ok":
+        return {r: ("pass", []) for r in rels}, []
+    if st != "fail":
+        return {}, [ctx.result_from("python", "Python 語法", st, rc, text, dur, limit, argv)]
+    by, stray = attribute_lines(text, rels, ctx.project)
+    if rc == 1 and by and not stray:
+        return {r: (("fail", by[r]) if r in by else ("pass", [])) for r in rels}, []
+    return {}, [Result("python", "Python 語法", "fail",
+                       summarize(text, ctx.cfg["max_lines"], ctx.project), rc, dur)]
+
+
+# ---- 逐檔驗證器的工具識別:回傳 (識別字串, None) 或 (None, 缺工具的 Result)
+
+def _exe_tool(vid, label, exe, extra=lambda ctx: ""):
+    def ident(ctx):
+        i = exe_identity(exe)
+        if i is None:
+            return None, Result(vid, label, "missing", [f"找不到 {exe}(不在 PATH)"])
+        return i + "|" + extra(ctx), None
+    return ident
+
+
+def _xlsx_tool(ctx):
+    try:
+        import openpyxl  # noqa: PLC0415
+        return "openpyxl " + str(getattr(openpyxl, "__version__", "?")), None
+    except Exception:
+        return None, Result("xlsx", "Excel xlsx", "missing", ["openpyxl 未安裝(pip install openpyxl)"])
+
+
+def _python_tool(ctx):
+    py = project_python(ctx.project)
+    return (exe_identity(py) or py), None
+
+
+def _rc_digest(ctx, *names):
+    """設定檔(例如 .shellcheckrc)也會改變結果:把它們的內容雜湊算進工具識別。"""
+    rels = [r for r in ctx.files() if r.rsplit("/", 1)[-1] in names]
+    return ctx.manifest.digest(rels) if rels else ""
+
+
+def _asl_digest(ctx):
+    """ASL 的 Include 會把 .asl/.asi 拉進來:它們改了,所有 .dsl 都要重編。"""
+    rels = [r for r in ctx.files() if r.lower().endswith((".asl", ".asi"))]
+    return ctx.manifest.digest(rels) if rels else ""
+
+
+FILE_VALIDATORS = {
+    # vid: (標籤, 檔名樣式, runner, 工具識別)
+    "plist": ("plist 語法(plutil)", ("*.plist",), run_plist, _exe_tool("plist", "plist 語法(plutil)", "plutil")),
+    "acpi": ("ACPI/SSDT(iasl)", ("*.dsl",), run_acpi, _exe_tool("acpi", "ACPI/SSDT(iasl)", "iasl", _asl_digest)),
+    "xml": ("XML 格式", ("*.xml",), run_xml, lambda ctx: ("builtin", None)),
+    "json": ("JSON 格式", ("*.json",), run_json, lambda ctx: ("builtin|" + ",".join(JSONC_NAMES), None)),
+    "xlsx": ("Excel xlsx", ("*.xlsx",), run_xlsx, _xlsx_tool),
+    "shell": ("shellcheck", ("*.sh",), run_shell,
+              _exe_tool("shell", "shellcheck", "shellcheck",
+                        lambda ctx: _rc_digest(ctx, ".shellcheckrc", "shellcheckrc"))),
+    "python": ("Python 語法", ("*.py",), run_python_syntax, _python_tool),
+}
+
+
+def run_file_validator(ctx, vid, rels=None):
+    """不經快取,直接驗證全部(或指定的)檔案 → list[Result]。"""
+    label, patterns, runner, ident = FILE_VALIDATORS[vid]
+    targets = ctx.glob_rel(*patterns) if rels is None else rels
+    if not targets:
+        return []
+    _, missing = ident(ctx)
+    if missing is not None:
+        return [missing]
+    t0 = time.monotonic()
+    outcomes, extras = runner(ctx, targets)
+    return file_results(ctx, vid, label, targets, outcomes, extras, time.monotonic() - t0)
+
+
+# ---------------------------------------------------------------- 專案層級驗證器
+# spec = dict(vid, label, run=callable→list[Result], inputs=("any"|"precise", rels|None, 原因),
+#             env=識別字串, cacheable=bool)
+# 只快取「通過」:失敗可能是環境問題(少裝套件),裝好之後檔案沒變也必須重跑。
+
+FW_SOURCE_EXT = (".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".h++",
+                 ".ipp", ".tpp", ".inc", ".inl", ".ino", ".pde", ".s", ".asm", ".ld", ".lf", ".csv")
+FW_CONFIG_NAMES = {"platformio.ini", "CMakeLists.txt", "sdkconfig", "idf_component.yml",
+                   "dependencies.lock", "sketch.yaml", "library.json", "library.properties",
+                   "Makefile", "component.mk"}
+FW_CONFIG_GLOBS = ("*.cmake", "sdkconfig.*", "Kconfig*", "*.projbuild")
+# 建置會讀「無法從設定靜態看出來」的檔案時,改成任何變更都重建(保守)。
+FW_DYNAMIC_CMAKE_RE = re.compile(
+    r"\b(?:file\s*\(\s*(?:GLOB|GLOB_RECURSE|READ|STRINGS)\b|configure_file\s*\(|execute_process\s*\("
+    r"|add_custom_command\s*\(|add_custom_target\s*\(|\w*_create_partition_image\s*\(|fatfs_create_\w*_image\s*\()",
+    re.I)
+CMAKE_TOKEN_RE = re.compile(r'"[^"]*"|[^\s()"]+|[()]')
+CMAKE_KEYWORD_RE = re.compile(r"[A-Z][A-Z0-9_]+")
+
+
+def cmake_embedded_tokens(text):
+    """從 CMake 文字取出 EMBED_FILES / EMBED_TXTFILES / target_add_binary_data 的路徑 token。
+    先切 token 再判斷:不加引號的全大寫字是下一個關鍵字;路徑(含 / 或 .)就算大寫也不會被誤判。"""
+    text = re.sub(r"(?m)#.*$", "", text)
+    toks = CMAKE_TOKEN_RE.findall(text)
+    out, collecting = [], False
+    for i, t in enumerate(toks):
+        if t in ("EMBED_FILES", "EMBED_TXTFILES"):
+            collecting = True
+            continue
+        if collecting:
+            if t in ("(", ")") or CMAKE_KEYWORD_RE.fullmatch(t):
+                collecting = False
+            else:
+                out.append(t)
+                continue
+        if t.lower() == "target_add_binary_data" and i + 3 < len(toks) and toks[i + 1] == "(":
+            out.append(toks[i + 3])  # target_add_binary_data(<target> <file> ...)
+    return out
+
+
+def _norm_rel(project, base_dir, token):
+    """把設定裡寫的路徑轉成專案相對路徑;落在專案外或含變數就回 None(→ 保守模式)。"""
+    token = token.strip().strip('"').strip("'")
+    if not token or "${" in token or "$(" in token:
+        return None
+    p = Path(token)
+    p = p if p.is_absolute() else (base_dir / p)
+    try:
+        return Path(os.path.normpath(str(p))).relative_to(project).as_posix()
+    except ValueError:
+        return None
+
+
+def firmware_inputs(ctx):
+    """韌體建置的輸入檔:原始碼/標頭/建置設定 + 設定裡宣告要嵌入的檔案。
+    發現建置會讀「靜態看不出來」的東西(file(GLOB)、configure_file、PlatformIO extra_scripts、
+    嵌入路徑含變數…)就改成任何變更都重建,寧可多建一次也不漏。"""
+    pr = ctx.project
+    embedded = set()
+    for rel in ctx.files():
+        name = rel.rsplit("/", 1)[-1]
+        if name != "CMakeLists.txt" and not name.endswith(".cmake"):
+            continue
+        text = _read_small(pr / rel, 256 * 1024)
+        m = FW_DYNAMIC_CMAKE_RE.search(text)
+        if m:
+            return ("any", None, f"{rel} 使用 {m.group(0).strip()}")
+        base = (pr / rel).parent
+        for tok in cmake_embedded_tokens(text):
+            nr = _norm_rel(pr, base, tok)
+            if nr is None:
+                return ("any", None, f"{rel} 的嵌入路徑無法靜態解析:{tok}")
+            embedded.add(nr)
+    ini = pr / "platformio.ini"
+    if ini.exists():
+        text = _read_small(ini, 256 * 1024)
+        if re.search(r"^\s*extra_scripts\s*=", text, re.M):
+            return ("any", None, "platformio.ini 使用 extra_scripts")
+        for m in re.finditer(r"^\s*board_build\.embed_(?:txt)?files\s*=(.*(?:\n[ \t]+.*)*)", text, re.M):
+            for tok in m.group(1).split():
+                nr = _norm_rel(pr, pr, tok)
+                if nr is None:
+                    return ("any", None, f"platformio.ini 的嵌入路徑無法靜態解析:{tok}")
+                embedded.add(nr)
+    rels = []
+    for rel in ctx.files():
+        name = rel.rsplit("/", 1)[-1]
+        if (rel in embedded or name in FW_CONFIG_NAMES or name.lower().endswith(FW_SOURCE_EXT)
+                or any(fnmatch.fnmatch(name, g) for g in FW_CONFIG_GLOBS)):
+            rels.append(rel)
+    missing_embeds = sorted(e for e in embedded if e not in ctx.manifest.entries)
+    reason = f"原始碼/設定 {len(rels)} 個檔案,嵌入 {len(embedded)} 個"
+    if missing_embeds:
+        reason += f"(其中 {len(missing_embeds)} 個不存在,建置應會失敗)"
+    return ("precise", rels + missing_embeds, reason)
+
+
+def spec_firmware(ctx):
+    pr = ctx.project
+    if (pr / "platformio.ini").exists():
+        cmd, label = ["pio", "run"], "PlatformIO 建置"
+    elif (pr / "CMakeLists.txt").exists() and (
+            (pr / "sdkconfig").exists() or (pr / "sdkconfig.defaults").exists()
+            or (pr / "main" / "idf_component.yml").exists()):
+        cmd, label = ["idf.py", "build"], "ESP-IDF 建置"
+    elif (pr / "sketch.yaml").exists():
+        prof = pr / ".claude" / "arduino-profile"
+        p = prof.read_text(encoding="utf-8").strip() if prof.exists() else "default"
+        cmd, label = ["arduino-cli", "compile", "--profile", p], "arduino-cli 編譯"
+    else:
+        inos = ctx.glob("*.ino")
+        fqbn = pr / ".claude" / "fqbn"
+        if not (inos and fqbn.exists()):
+            return None
+        cmd = ["arduino-cli", "compile", "-b", fqbn.read_text(encoding="utf-8").strip(),
+               str(inos[0].parent)]
+        label = "arduino-cli 編譯"
+    env = "|".join([str(exe_identity(cmd[0])), " ".join(cmd),
+                    _read_small(pr / ".claude" / "fqbn"), _read_small(pr / ".claude" / "arduino-profile"),
+                    path_sig(pr / ".pio" / "libdeps"), path_sig(pr / "managed_components"),
+                    env_sig(prefixes=("IDF_", "PLATFORMIO_", "ESP_IDF", "ARDUINO_"))])
+    return dict(vid="firmware", label=label, run=lambda: [ctx.tool("firmware", label, cmd)],
+                inputs=firmware_inputs(ctx), env=env, cacheable=True)
+
+
+def spec_opencore(ctx):
+    oc = next((p for p in ctx.glob("*.plist") if p.name == "config.plist"), None)
+    if oc is None:
+        return None
+    label = "OpenCore 語意(ocvalidate)"
+
+    def run():
+        r = ctx.tool("opencore", label, ["ocvalidate", str(oc)])
+        if r.status == "fail":
+            r.lines.append("注意:ocvalidate 版本須對應你的 OpenCore release")
+        return [r]
+    base = ctx.rel(oc.parent)
+    prefix = "" if base == "." else base + "/"
+    rels = [r for r in ctx.files() if r.startswith(prefix)]
+    return dict(vid="opencore", label=label, run=run, env=str(exe_identity("ocvalidate")),
+                inputs=("precise", rels, f"{prefix or './'} 底下 {len(rels)} 個檔案"), cacheable=True)
+
+
+def spec_adblock(ctx):
+    if not ctx.glob(".aglintrc", ".aglintrc.yaml", ".aglintrc.yml", ".aglintrc.json"):
+        return None
+    runner = ["aglint"] if shutil.which("aglint") else ["npx", "--no-install", "aglint"]
+
+    # 保險:AGLint 的 exit code 規格未經官方確認,部分 linter 即使有錯仍回 0,
+    # 故同時偵測輸出中的 error token(格式如 "12:0  error  ..."),避免漏接。
+    def failed(rc, text):
+        return rc != 0 or bool(re.search(r"\d+:\d+\s+error\b", text))
+    label = "AdGuard 規則(aglint)"
+    env = "|".join([str(exe_identity(runner[0])), path_sig(ctx.project / "node_modules" / ".package-lock.json")])
+    return dict(vid="adblock", label=label, run=lambda: [ctx.tool("adblock", label, runner, fail_detect=failed)],
+                inputs=("any", None, "規則檔可能是任何副檔名"), env=env, cacheable=True)
+
+
+def _venv_sig(project):
+    sigs = []
+    for vdir in (".venv", "venv"):
+        base = project / vdir
+        if base.is_dir():
+            for sp in sorted(list(base.glob("lib/python*/site-packages")) + list(base.glob("Lib/site-packages"))):
+                sigs.append(f"{sp.name}:{path_sig(sp)}")
+    return ",".join(sigs)
+
+
+def check_pytest(ctx):
+    py = project_python(ctx.project)
     # 用「該直譯器能不能 import pytest」當判準,而不是 PATH 上有沒有 pytest ——
     # venv 沒裝 pytest 時硬跑會回非 0,變成另一種假擋。
     # 探測本身的結果要分清楚:只有「跑完且 import 失敗」才是缺 pytest。
@@ -891,49 +1330,132 @@ def check_python(ctx):
     limit = max(0.0, min(30.0, ctx.remaining() - 3.0))
     st, _, text, dur = run_tool([py, "-c", "import pytest"], str(ctx.project), limit)
     if st == "timeout":
-        out.append(timeout_result("pytest", "pytest", limit, dur, ctx.budget_cause("pytest", limit),
-                                  _display_cmd([py, "-c", "import pytest"])))
-        return out
+        return [timeout_result("pytest", "pytest", limit, dur, ctx.budget_cause("pytest", limit),
+                               _display_cmd([py, "-c", "import pytest"]))]
     if st == "error":
-        out.append(Result("pytest", "pytest", "error", [clip(text, 220)], duration=dur))
-        return out
+        return [Result("pytest", "pytest", "error", [clip(text, 220)], duration=dur)]
     if st != "ok":  # fail(ImportError)或 missing(直譯器本身不見了)
-        out.append(Result("pytest", "pytest", "missing", [f"{py} 沒有 pytest(pip install pytest)"]))
-        return out
+        return [Result("pytest", "pytest", "missing", [f"{py} 沒有 pytest(pip install pytest)"])]
 
     # rc 5 = 沒有收集到任何測試:不是失敗(舊版會因此誤擋)。
     def failed(rc, _text):
         return rc not in (0, 5)
-    out.append(ctx.tool("pytest", "pytest", [py, "-m", "pytest", "-q", "--tb=short", "-rfE"],
-                        fail_detect=failed))
-    return out
+    return [ctx.tool("pytest", "pytest", [py, "-m", "pytest", "-q", "--tb=short", "-rfE"],
+                     fail_detect=failed)]
 
 
-def check_node(ctx):
+def _has_tests(ctx):
+    return bool(ctx.glob("test_*.py", "*_test.py")) or (ctx.project / "tests").is_dir()
+
+
+def spec_pytest(ctx):
+    if not ctx.glob("*.py") or not _has_tests(ctx):
+        return None
+    py = project_python(ctx.project)
+    env = "|".join([str(exe_identity(py)), _venv_sig(ctx.project),
+                    env_sig(names=("PYTHONPATH", "VIRTUAL_ENV", "PYTEST_ADDOPTS"))])
+    # 測試可能讀專案裡任何檔案(fixture、資料、設定),無法靜態判斷 → 任何變更都重跑。
+    return dict(vid="pytest", label="pytest", run=lambda: check_pytest(ctx),
+                inputs=("any", None, "測試可能讀取任何檔案"), env=env, cacheable=True)
+
+
+def _node_cmd(ctx):
     pkg = ctx.project / "package.json"
     if not pkg.exists():
-        return []
+        return None
     try:
         scripts = json.loads(pkg.read_text(encoding="utf-8-sig") or "{}").get("scripts", {})
     except Exception:
         scripts = {}
     if not isinstance(scripts, dict):
         scripts = {}
-    cmd = ["npm", "test"] if "test" in scripts else (["npm", "run", "build"] if "build" in scripts else None)
+    return ["npm", "test"] if "test" in scripts else (["npm", "run", "build"] if "build" in scripts else None)
+
+
+def spec_node(ctx):
+    cmd = _node_cmd(ctx)
     if cmd is None:
-        return []
-    return [ctx.tool("node", " ".join(cmd), cmd)]
+        return None
+    label = " ".join(cmd)
+    nm = ctx.project / "node_modules"
+    env = "|".join([str(exe_identity("npm")), str(exe_identity("node")), path_sig(nm),
+                    path_sig(nm / ".package-lock.json"), env_sig(names=("NODE_ENV", "NODE_OPTIONS"))])
+    return dict(vid="node", label=label, run=lambda: [ctx.tool("node", label, cmd)],
+                inputs=("any", None, "測試/打包可能讀取任何檔案"), env=env, cacheable=True)
+
+
+def spec_rust(ctx):
+    if not (ctx.project / "Cargo.toml").exists():
+        return None
+    env = "|".join([str(exe_identity("cargo")), str(exe_identity("rustc")), env_sig(names=("RUSTFLAGS",))])
+    return dict(vid="rust", label="cargo test",
+                run=lambda: [ctx.tool("rust", "cargo test", ["cargo", "test", "--quiet"])],
+                inputs=("any", None, "build.rs / include_str! / 測試可能讀取任何檔案"), env=env, cacheable=True)
+
+
+# ---- Stage 1 介面(不經快取):回傳 list[Result],不適用回傳 []
+
+def _run_spec(spec):
+    return spec["run"]() if spec else []
+
+
+def check_firmware(ctx):
+    return _run_spec(spec_firmware(ctx))
+
+
+def check_plist(ctx):
+    return run_file_validator(ctx, "plist") + _run_spec(spec_opencore(ctx))
+
+
+def check_acpi(ctx):
+    return run_file_validator(ctx, "acpi")
+
+
+def check_xml(ctx):
+    return run_file_validator(ctx, "xml")
+
+
+def check_json(ctx):
+    return run_file_validator(ctx, "json")
+
+
+def check_adblock(ctx):
+    return _run_spec(spec_adblock(ctx))
+
+
+def check_xlsx(ctx):
+    return run_file_validator(ctx, "xlsx")
+
+
+def check_shell(ctx):
+    return run_file_validator(ctx, "shell")
+
+
+def check_python(ctx):
+    out = run_file_validator(ctx, "python")
+    if out and _has_tests(ctx):
+        out += check_pytest(ctx)
+    return out
+
+
+def check_node(ctx):
+    return _run_spec(spec_node(ctx))
 
 
 def check_cargo(ctx):
-    if not (ctx.project / "Cargo.toml").exists():
-        return []
-    return [ctx.tool("rust", "cargo test", ["cargo", "test", "--quiet"])]
+    return _run_spec(spec_rust(ctx))
 
 
 BUILTIN_CHECKS = [
     check_firmware, check_plist, check_acpi, check_xml, check_json,
     check_adblock, check_xlsx, check_shell, check_python, check_node, check_cargo,
+]
+
+# 有快取的流程用的順序(結果也照這個順序回報)。
+PIPELINE = [
+    ("firmware", spec_firmware), ("plist", None), ("opencore", spec_opencore), ("acpi", None),
+    ("xml", None), ("json", None), ("adblock", spec_adblock), ("xlsx", None), ("shell", None),
+    ("python", None), ("pytest", spec_pytest), ("node", spec_node), ("rust", spec_rust),
 ]
 
 
@@ -948,15 +1470,164 @@ def find_override(project):
     return None
 
 
-def run_override(ctx, f):
+def _override_cmd(f):
     suffix = f.suffix.lower()
     if suffix == ".py":
-        cmd = [sys.executable, str(f)]
-    elif suffix == ".sh":
-        cmd = ["sh", str(f)]
-    else:  # .cmd / .bat / 無副檔名(需 +x)
-        cmd = [str(f)]
-    return [ctx.tool("override", f"專案自訂驗證 .claude/{f.name}", cmd)]
+        return [sys.executable, str(f)]
+    if suffix == ".sh":
+        return ["sh", str(f)]
+    return [str(f)]  # .cmd / .bat / 無副檔名(需 +x)
+
+
+def run_override(ctx, f):
+    return [ctx.tool("override", f"專案自訂驗證 .claude/{f.name}", _override_cmd(f))]
+
+
+def spec_override(ctx, f):
+    cmd = _override_cmd(f)
+    label = f"專案自訂驗證 .claude/{f.name}"
+    # 自訂腳本讀什麼完全不知道 → 任何檔案變更都重跑;override_cache=false 則每次都跑(Stage 1 行為)。
+    return dict(vid="override", label=label, run=lambda: [ctx.tool("override", label, cmd)],
+                inputs=("any", None, "自訂腳本可能讀取任何檔案"), env=str(exe_identity(cmd[0])),
+                cacheable=bool(ctx.cfg["override_cache"]))
+
+
+# ---------------------------------------------------------------- 排程:決定誰要跑、誰沿用快取
+
+def plan_and_run(ctx, cache_results, override=None):
+    """回傳 (results 依固定順序, 新的快取結果, debug 計畫)。"""
+    use_cache = bool(ctx.cfg["cache"])
+    man = ctx.manifest
+    all_digest = man.digest()
+    resolved, jobs, plan, new_cache = {}, [], [], {}
+
+    def project_job(idx, spec):
+        vid = spec["vid"]
+        mode, rels, why = spec["inputs"]
+        idig = all_digest if mode == "any" else man.digest(rels)
+        key = hashlib.sha256("\0".join([vid, str(VALIDATOR_VERSIONS[vid]), spec["env"], mode, idig])
+                             .encode("utf-8", "surrogateescape")).hexdigest()
+        # precise 模式:任何檔案被刪除都重跑 —— 被刪的可能是建置用到、但我們沒認出來的檔案
+        forced = mode == "precise" and bool(man.deleted)
+        prev = cache_results.get(vid) if (use_cache and spec["cacheable"]) else None
+        if isinstance(prev, dict) and prev.get("key") == key and prev.get("status") == "pass" and not forced:
+            resolved[idx] = [Result(vid, spec["label"], "pass", meta={"cached": True})]
+            new_cache[vid] = prev
+            plan.append({"id": vid, "action": "cached", "why": f"輸入未變({mode}:{why})"})
+            return
+        reason = "有檔案被刪除" if forced else ("沒有快取" if not prev else "輸入或環境有變")
+        plan.append({"id": vid, "action": "run", "why": f"{reason}({mode}:{why})"})
+
+        def job():
+            res = spec["run"]()
+            ok = all(r.status == "pass" for r in res)
+            return res, ({"key": key, "status": "pass"} if ok and spec["cacheable"] else None)
+        jobs.append((idx, vid, vid in HEAVY, job))
+
+    def file_job(idx, vid):
+        label, patterns, runner, ident = FILE_VALIDATORS[vid]
+        targets = ctx.glob_rel(*patterns)
+        if not targets:
+            return
+        tool_id, missing = ident(ctx)
+        if missing is not None:
+            resolved[idx] = [missing]
+            plan.append({"id": vid, "action": "missing", "why": missing.lines[0]})
+            return
+        tool_key = f"{vid}:{VALIDATOR_VERSIONS[vid]}:{tool_id}"
+        prev = cache_results.get(vid) if use_cache else None
+        prev_files = prev.get("files") if (isinstance(prev, dict) and prev.get("tool") == tool_key
+                                           and isinstance(prev.get("files"), dict)) else {}
+        cached, todo = {}, []
+        for rel in targets:
+            h = man.hash_of(rel)
+            p = prev_files.get(rel)
+            if h and isinstance(p, list) and len(p) == 3 and p[0] == h and p[1] in ("pass", "fail"):
+                cached[rel] = (p[1], p[2])
+            else:
+                todo.append(rel)
+
+        def job():
+            t0 = time.monotonic()
+            outcomes, extras = runner(ctx, todo) if todo else ({}, [])
+            allo = dict(cached)
+            allo.update(outcomes)
+            meta = {"checked": len(outcomes), "cached": len(cached)}
+            res = file_results(ctx, vid, label, targets, allo, extras, time.monotonic() - t0, meta)
+            entry = {"tool": tool_key, "files": {r: [man.hash_of(r), o[0], o[1]] for r, o in allo.items()}}
+            return res, entry
+        if not todo:
+            resolved[idx], new_cache[vid] = job()
+            plan.append({"id": vid, "action": "cached", "why": f"{len(targets)} 個檔案內容都沒變"})
+        else:
+            plan.append({"id": vid, "action": "run",
+                         "why": f"檢查 {len(todo)} 個變更的檔案,沿用 {len(cached)} 個",
+                         "files": todo[:20]})
+            jobs.append((idx, vid, False, job))
+
+    if override is not None:
+        project_job(0, spec_override(ctx, override))
+    else:
+        for idx, (vid, spec_fn) in enumerate(PIPELINE):
+            try:
+                if spec_fn is None:
+                    file_job(idx, vid)
+                else:
+                    spec = spec_fn(ctx)
+                    if spec is None:
+                        if ctx.debug:
+                            plan.append({"id": vid, "action": "n/a"})
+                        continue
+                    project_job(idx, spec)
+            except Exception as e:
+                resolved[idx] = [Result(vid, vid, "error", [f"內部錯誤:{clip(repr(e), 200)}"])]
+
+    for idx, (res, entry) in execute_jobs(ctx, jobs).items():
+        resolved[idx] = res
+        if entry is not None:
+            new_cache[jobs_vid(jobs, idx)] = entry
+    results = [r for idx in sorted(resolved) for r in resolved[idx]]
+    return results, new_cache, plan
+
+
+def jobs_vid(jobs, idx):
+    return next(v for i, v, _, _ in jobs if i == idx)
+
+
+def execute_jobs(ctx, jobs):
+    """彼此獨立的驗證器平行執行:總共最多 max_parallel 個,其中重型(建置/測試)最多 max_heavy 個。
+    max_parallel=1 → 完全依序執行。"""
+    out = {}
+    if not jobs:
+        return out
+    maxp = max(1, int(ctx.cfg["max_parallel"]))
+    h = max(1, min(int(ctx.cfg["max_heavy"]), maxp))
+    light_n = maxp - h
+
+    def guarded(idx, vid, fn):
+        try:
+            return fn()
+        except Exception as e:
+            return [Result(vid, vid, "error", [f"內部錯誤:{clip(repr(e), 200)}"])], None
+
+    if len(jobs) == 1 or maxp == 1:
+        for idx, vid, _, fn in sorted(jobs, key=lambda j: (not j[2], j[0])):
+            out[idx] = guarded(idx, vid, fn)
+        return out
+    heavy_pool = ThreadPoolExecutor(max_workers=h)
+    light_pool = ThreadPoolExecutor(max_workers=light_n) if light_n > 0 else heavy_pool
+    try:
+        futs = {}
+        for idx, vid, heavy, fn in sorted(jobs, key=lambda j: (not j[2], j[0])):  # 重型先排:它們最久
+            pool = heavy_pool if heavy else light_pool
+            futs[pool.submit(guarded, idx, vid, fn)] = idx
+        for fut in as_completed(futs):
+            out[futs[fut]] = fut.result()
+    finally:
+        heavy_pool.shutdown(wait=True)
+        if light_pool is not heavy_pool:
+            light_pool.shutdown(wait=True)
+    return out
 
 
 # ---------------------------------------------------------------- 狀態、紀錄、輸出
@@ -1123,7 +1794,11 @@ def main():
     state["session"] = session
 
     ctx = Ctx(project, cfg, t0)
-    fp_before = fingerprint(project, ctx.files())
+    cache = load_cache(project)
+    manifest = Manifest(project, cache["manifest"], cfg["trust_mtime"]).scan(
+        ctx.files() + claude_extras(project))
+    ctx.manifest = manifest
+    fp_before = fingerprint(manifest)
 
     if active:
         if not cfg["rerun_when_active"]:
@@ -1146,19 +1821,12 @@ def main():
                 f"紀錄在 .claude/{LOG_NAME}。"]))
 
     override = find_override(project)
-    if override is None and state.get("ok_fp") == fp_before:
+    if state.get("ok_fp") == fp_before and (override is None or cfg["override_cache"]):
+        if ctx.debug:
+            append_log(project, {"decision": "allow-unchanged-green", "changes": manifest.changes()})
         finish(cfg, system=warning_message([], notes))  # 自上次全綠後沒有任何變更
 
-    results = []
-    if override is not None:
-        results = run_override(ctx, override)
-    else:
-        for chk in BUILTIN_CHECKS:
-            try:
-                results.extend(chk(ctx))
-            except Exception as e:
-                results.append(Result(chk.__name__.replace("check_", ""), chk.__name__,
-                                      "error", [f"內部錯誤:{clip(repr(e), 200)}"]))
+    results, new_cache, plan = plan_and_run(ctx, cache["results"], override)
 
     blocking, warnings = [], []
     for r in results:
@@ -1169,15 +1837,26 @@ def main():
             warnings.append(r)
         if r.status in ("missing", "timeout", "error"):
             warn(f"{r.vid}: {r.status} {' / '.join(r.lines)}")
+    if ctx.debug:
+        for step in plan:
+            warn(f"plan {step['id']}: {step['action']} — {step.get('why', '')}")
 
+    # 驗證器可能寫檔(例如 iasl 產生 .aml):重新掃一次,記下「驗證完之後」的狀態。
     ctx.reset_files()
-    fp_after = fingerprint(project, ctx.files())
-    append_log(project, {
+    after = Manifest(project, manifest.entries, cfg["trust_mtime"]).scan(
+        ctx.files() + claude_extras(project))
+    fp_after = fingerprint(after)
+    save_cache(project, after, new_cache)
+    record = {
         "decision": "block" if blocking else "allow", "active": active,
         "sec": round(time.monotonic() - t0, 2),
         "results": [r.as_log() for r in results],
         "suspect": [r.vid for r in results if r.status == "timeout"],
-    })
+    }
+    if ctx.debug:
+        record["changes"] = manifest.changes()
+        record["plan"] = plan
+    append_log(project, record)
 
     if blocking:
         state["blocks"] = state.get("blocks", 0) + 1
@@ -1193,8 +1872,10 @@ def main():
     state.pop("last_block", None)
     if any(r.status in ("timeout", "error") for r in results):
         state.pop("ok_fp", None)  # 沒驗完不算綠,下次重驗
-    elif override is None:
+    elif override is None or cfg["override_cache"]:
         state["ok_fp"] = fp_after
+    else:
+        state.pop("ok_fp", None)
     save_state(project, state)
     finish(cfg, system=warning_message(warnings, notes))
 

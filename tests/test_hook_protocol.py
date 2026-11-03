@@ -224,9 +224,10 @@ def test_internal_error_fails_open_but_is_visible(hook, project, monkeypatch, ca
 def test_crashing_validator_is_a_warning_not_a_block(hook, project, monkeypatch, capsys):
     write(project, "data.json", '{"ok": 1}')
 
-    def check_boom(_ctx):
+    def spec_boom(_ctx):
         raise ValueError("validator exploded")
-    monkeypatch.setattr(hook, "BUILTIN_CHECKS", [check_boom] + list(hook.BUILTIN_CHECKS))
+    # Stage 2 起有快取的流程走 PIPELINE(BUILTIN_CHECKS 只剩不經快取的介面)
+    monkeypatch.setattr(hook, "PIPELINE", [("firmware", spec_boom)] + list(hook.PIPELINE))
     code, out = _run_entry(hook, monkeypatch, capsys, project, {})
     assert code == 0
     msg = json.loads(out.out)
