@@ -51,14 +51,15 @@ def sha(path):
 
 
 class Suite:
-    def __init__(self, name, work, env=None, hook_py=None):
+    def __init__(self, name, work, env=None, hook_py=None, keep=False):
+        """keep=True:沿用準備階段已經建好的目錄(兩段式執行:先有網路安裝、再無網路建置與測試)。"""
         self.name = name
         self.dir = Path(work) / name
-        if self.dir.exists():
+        if self.dir.exists() and not keep:
             shutil.rmtree(self.dir)
-        self.dir.mkdir(parents=True)
+        self.dir.mkdir(parents=True, exist_ok=True)
         self.proj = self.dir / "proj"
-        self.proj.mkdir()
+        self.proj.mkdir(exist_ok=True)
         self.env = dict(env or {})
         self.hook_py = hook_py or sys.executable
         self.steps, self.setup, self.versions, self.notes = [], [], {}, []

@@ -1377,7 +1377,13 @@ def tree_sig(path, cap=None):
     h = hashlib.sha256()
     n = 0
     over = False
+    top_cache = os.path.basename(os.path.normpath(root)) == "node_modules"
     for dirpath, dirs, files in os.walk(root):
+        if top_cache and dirpath == root and ".cache" in dirs:
+            # node_modules/.cache 是工具自己的快取(xo、ava、eslint、babel 的 find-cache-dir 慣例):
+            # 每次跑測試都會變,算進簽章的話每次 Stop 都要重跑整套 npm test(實測 chalk:每次 9 秒以上)。
+            # 只排除最上層這一個;套件裡的 .cache 照常追蹤。
+            dirs.remove(".cache")
         dirs.sort()
         rel = os.path.relpath(dirpath, root)
         for fn in sorted(files):
