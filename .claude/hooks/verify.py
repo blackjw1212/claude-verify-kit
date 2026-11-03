@@ -131,6 +131,7 @@ DEFAULT_CONFIG = {
     "trust_mtime": True,            # False = 每次重新雜湊所有檔案(最慢、最保守)
     "debug": False,                 # 或環境變數 CLAUDE_VERIFY_DEBUG=1:把跳過/沿用的理由寫進紀錄
     "dep_scan_cap": 300000,         # 相依目錄(node_modules…)逐檔掃描的上限;超過 → 該驗證器每次都跑
+    "kill_leftover_processes": True,  # 工具結束後收掉它留下的背景程序;False = Stage 2 的行為(不收)
     "validators": {},               # {"<id>": {"timeout": 秒, "on_missing": ..., "on_timeout": ...}}
 }
 
@@ -141,7 +142,7 @@ DEFAULT_TIMEOUTS = {
     "opencore": 60, "acpi": 60, "xml": 60, "json": 60,
 }
 POLICIES = ("warn", "block", "ignore")
-BOOL_KEYS = ("rerun_when_active", "cache", "override_cache", "trust_mtime", "debug")
+BOOL_KEYS = ("rerun_when_active", "cache", "override_cache", "trust_mtime", "debug", "kill_leftover_processes")
 
 
 def is_debug(cfg):
@@ -324,6 +325,12 @@ def _kill_tree(proc):
     會留著繼續吃 CPU。輸出寫到暫存檔而非 pipe,所以孫程序不會讓我們卡在讀取。"""
     try:
         if IS_WIN:
+            job = getattr(proc, "_verify_job", None)
+            if job is not None:
+                try:
+                    job.terminate()      # 整個 job:包括父程序已經死掉、taskkill /T 找不到的孫程序
+                except Exception:
+                    pass
             taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
             subprocess.run([taskkill, "/F", "/T", "/PID", str(proc.pid)],
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -355,9 +362,195 @@ def _kill_tree(proc):
 
 # 正在跑的子程序。hook 自己被 SIGTERM/SIGINT 終止時(例如 Claude Code 的 hook 逾時),
 # 先把它們整棵收掉再離開 —— 子程序在獨立的 process group 裡,否則會變成孤兒繼續建置。
-# SIGKILL 攔不到:那種情況子程序會留著(已知限制),但快取不會被寫入,不會變成錯誤的通過。
+# SIGKILL 攔不到訊號處理器,所以另外有兩道外部機制(Stage 3-3):
+#   POSIX:看門程序(_watchdog_send)。它握著一條管線的讀端,hook 不論怎麼死,寫端都會被
+#          核心關掉 → 看門程序讀到 EOF → 收掉所有還登記著的程序群組。
+#   Windows:Job Object + KILL_ON_JOB_CLOSE。hook 死掉時它持有的 job 控制代碼被關閉,
+#          job 裡的程序(工具與它的子孫)由系統一起結束。
 _ACTIVE = set()
 _ACTIVE_LOCK = threading.RLock()
+_RUN = {"reap": True, "project": None, "parent": None, "parent_handle": None}
+
+_WATCHDOG_SRC = r"""
+import os, signal, sys, time
+fd = int(sys.argv[1])
+groups, buf = set(), b""
+while True:
+    try:
+        chunk = os.read(fd, 4096)
+    except InterruptedError:
+        continue
+    except OSError:
+        chunk = b""
+    if not chunk:
+        break
+    buf += chunk
+    *lines, buf = buf.split(b"\n")
+    for ln in lines:
+        try:
+            (groups.add if ln[:1] == b"+" else groups.discard)(int(ln[1:]))
+        except ValueError:
+            pass
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    if not groups:
+        break
+    for g in list(groups):
+        try:
+            os.killpg(g, sig)
+        except ProcessLookupError:
+            groups.discard(g)
+        except OSError:
+            pass
+    end = time.monotonic() + (1.5 if sig == signal.SIGTERM else 0)
+    while groups and time.monotonic() < end:     # 給 SIGTERM 最多 1.5 秒,群組都沒了就提早結束
+        for g in list(groups):
+            try:
+                os.killpg(g, 0)
+            except ProcessLookupError:
+                groups.discard(g)
+            except OSError:
+                pass
+        time.sleep(0.05)
+"""
+_WD = {"fd": None, "proc": None, "failed": False}
+_WD_LOCK = threading.Lock()
+
+
+def _watchdog_send(msg):
+    """POSIX:向看門程序登記(+pgid)或註銷(-pgid)一個程序群組。第一次登記時才啟動它。"""
+    if IS_WIN:
+        return
+    with _WD_LOCK:
+        if _WD["fd"] is None:
+            if _WD["failed"]:
+                return
+            try:
+                r, w = os.pipe()          # 兩端都不可繼承(PEP 446):工具拿不到寫端,不會讓 EOF 延後
+                _WD["proc"] = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", _WATCHDOG_SRC, str(r), str(os.getpid())], pass_fds=(r,),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)   # 自己的 session:跟 hook 一起被 killpg 時不會一起死
+                os.close(r)
+                _WD["fd"] = w
+            except Exception as e:
+                _WD["failed"] = True
+                warn(f"無法啟動看門程序(hook 被 SIGKILL 時工具可能留著):{e}")
+                return
+        try:
+            os.write(_WD["fd"], msg.encode())
+        except OSError:
+            pass
+
+
+class _WinJob:
+    """Windows Job Object(KILL_ON_JOB_CLOSE)。任何一步失敗就丟例外,呼叫端退回 taskkill。"""
+
+    def __init__(self):
+        import ctypes  # noqa: PLC0415
+        from ctypes import wintypes  # noqa: PLC0415
+        self.ct = ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        for fn in ("SetInformationJobObject", "QueryInformationJobObject"):
+            getattr(k32, fn).argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD) + (
+                (ctypes.c_void_p,) if fn.startswith("Query") else ())
+        k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class Ext(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_uint64 * 6),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        class Accounting(ctypes.Structure):
+            _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                        ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                        ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+                        ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
+        self.k32, self.Accounting = k32, Accounting
+        self.h = k32.CreateJobObjectW(None, None)
+        if not self.h:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW")
+        info = Ext()
+        info.BasicLimitInformation.LimitFlags = 0x2000          # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(self.h, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            err = ctypes.get_last_error()
+            self.close()
+            raise OSError(err, "SetInformationJobObject")
+
+    def assign(self, proc):
+        if not self.k32.AssignProcessToJobObject(self.h, int(proc._handle)):
+            raise OSError(self.ct.get_last_error(), "AssignProcessToJobObject")
+
+    def active(self):
+        acc = self.Accounting()
+        if not self.k32.QueryInformationJobObject(self.h, 1, self.ct.byref(acc), self.ct.sizeof(acc), None):
+            return 0
+        return int(acc.ActiveProcesses)
+
+    def terminate(self):
+        self.k32.TerminateJobObject(self.h, 1)
+
+    def close(self):
+        if self.h:
+            self.k32.CloseHandle(self.h)
+            self.h = None
+
+
+def _record_parent():
+    """記下 hook 的父程序(Claude Code)。它死掉時 hook 要停掉工具、不寫快取、直接結束。"""
+    try:
+        ppid = os.getppid()
+    except Exception:
+        return
+    _RUN["parent"] = ppid
+    if IS_WIN and ppid:
+        try:
+            import ctypes  # noqa: PLC0415
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = ctypes.c_void_p
+            _RUN["parent_handle"] = k32.OpenProcess(0x00100000, False, int(ppid)) or None   # SYNCHRONIZE
+        except Exception:
+            _RUN["parent_handle"] = None
+
+
+def _parent_gone():
+    ppid = _RUN["parent"]
+    if not ppid:
+        return False
+    if IS_WIN:
+        h = _RUN["parent_handle"]
+        if not h:
+            return False
+        try:
+            import ctypes  # noqa: PLC0415
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+            return k32.WaitForSingleObject(h, 0) == 0                 # WAIT_OBJECT_0:父程序已結束
+        except Exception:
+            return False
+    return ppid != 1 and os.getppid() != ppid
+
+
+def _abort_parent_gone():
+    """父程序已死:沒有人會讀這次的結果。收掉所有工具,記一筆紀錄,不寫快取直接結束。"""
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE)
+    for proc in procs:
+        _kill_tree(proc)
+    if _RUN["project"] is not None:
+        append_log(_RUN["project"], {"decision": "aborted", "why": "parent_gone",
+                                     "killed": [pr.pid for pr in procs]})
+    os._exit(1)
 
 
 def _terminate_children(signum, _frame):
@@ -390,13 +583,82 @@ def _read_capped(fh, head=64 * 1024, tail=512 * 1024):
     return first + b"\n...[output truncated]...\n" + fh.read()
 
 
+class ToolRun(tuple):
+    """run_tool 的結果:照舊是 (status, rc, text, seconds),另外帶 .info(寫進紀錄的 pid / 結束原因…)。"""
+
+    def __new__(cls, values, info=None):
+        self = tuple.__new__(cls, values)
+        self.info = dict(info or {})
+        return self
+
+
+def _proc_members(pgid):
+    """POSIX:程序群組裡還活著(非殭屍)的成員數。沒有 /proc 的系統(macOS)只能回答「群組還在不在」。"""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return 0
+    except PermissionError:
+        return 1
+    if not os.path.isdir("/proc/self"):
+        return 1
+    n = 0
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return 1
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as fh:
+                stat = fh.read().rsplit(b")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if len(stat) > 2 and stat[0] != b"Z" and int(stat[2]) == pgid:
+            n += 1
+    return n
+
+
+def _reap_leftovers(proc):
+    """工具已經結束,但它的程序群組 / job 裡還有程序(背景伺服器、沒收的子程序)→ 收掉。回傳有沒有留下。"""
+    if IS_WIN:
+        job = getattr(proc, "_verify_job", None)
+        if job is None or job.active() == 0:
+            return False
+        if _RUN["reap"]:
+            job.terminate()
+        return True
+    if _proc_members(proc.pid) == 0:
+        return False
+    if _RUN["reap"]:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and _proc_members(proc.pid):
+            time.sleep(0.02)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return True
+
+
+def _end_reason(rc):
+    if rc is None:
+        return "timeout_killed"
+    return f"signal {-rc}" if rc < 0 else "exit"
+
+
 def run_tool(argv, cwd, timeout, env=None, stdin_bytes=None):
-    """→ (status, rc, text, seconds);status ∈ ok / fail / missing / timeout / error。"""
+    """→ ToolRun((status, rc, text, seconds), info);status ∈ ok / fail / missing / timeout / error。"""
     if timeout <= 0:
-        return "timeout", None, "整體時間預算已用盡,未執行", 0.0
+        return ToolRun(("timeout", None, "整體時間預算已用盡,未執行", 0.0))
     spawn, why = resolve_argv(argv)
     if spawn is None:
-        return why[0], None, why[1], 0.0
+        return ToolRun((why[0], None, why[1], 0.0))
     out = tempfile.TemporaryFile()
     inp = subprocess.DEVNULL  # 不讓工具等鍵盤輸入而卡到逾時
     if stdin_bytes is not None:
@@ -411,6 +673,7 @@ def run_tool(argv, cwd, timeout, env=None, stdin_bytes=None):
                                    | getattr(subprocess, "CREATE_NO_WINDOW", 0))
     else:
         kwargs["start_new_session"] = True
+    info = {}
     t0 = time.monotonic()
     try:
         proc = subprocess.Popen(spawn, **kwargs)
@@ -418,20 +681,48 @@ def run_tool(argv, cwd, timeout, env=None, stdin_bytes=None):
             _ACTIVE.add(proc)
     except FileNotFoundError:
         out.close()
-        return "missing", None, f"找不到 {argv[0]}", 0.0
+        return ToolRun(("missing", None, f"找不到 {argv[0]}", 0.0))
     except OSError as e:
         out.close()
-        return "error", None, f"無法執行 {argv[0]}:{e}", 0.0
+        return ToolRun(("error", None, f"無法執行 {argv[0]}:{e}", 0.0))
+    info["pid"] = proc.pid
+    if IS_WIN:
+        try:
+            job = _WinJob()
+            job.assign(proc)
+            proc._verify_job = job
+            info["job"] = True
+        except Exception as e:     # 拿不到 job(例如舊系統不允許巢狀 job)→ 退回 taskkill /T
+            warn(f"無法建立 Job Object:{e}")
+            info["job"] = False
+    else:
+        _watchdog_send(f"+{proc.pid}\n")
+    deadline = t0 + timeout
     try:
-        rc = proc.wait(timeout=timeout)
-        status = "ok" if rc == 0 else "fail"
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc)
-        rc, status = None, "timeout"
+        while True:
+            try:
+                rc = proc.wait(timeout=max(0.0, min(0.5, deadline - time.monotonic())))
+                status = "ok" if rc == 0 else "fail"
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    _kill_tree(proc)
+                    rc, status = None, "timeout"
+                    break
+                if _parent_gone():
+                    _abort_parent_gone()
+        if status in ("ok", "fail"):
+            info["leftovers"] = _reap_leftovers(proc)
     finally:
         with _ACTIVE_LOCK:
             _ACTIVE.discard(proc)
+        if not IS_WIN:
+            _watchdog_send(f"-{proc.pid}\n")
+        job = getattr(proc, "_verify_job", None)
+        if job is not None:
+            job.close()
     dur = time.monotonic() - t0
+    info["end"] = _end_reason(rc)
     try:
         text = decode_output(_read_capped(out))
     finally:
@@ -440,7 +731,7 @@ def run_tool(argv, cwd, timeout, env=None, stdin_bytes=None):
             inp.close()
     if status == "timeout":
         text = f"逾時(>{timeout:.0f}s),已終止整個程序樹\n" + text
-    return status, rc, text, dur
+    return ToolRun((status, rc, text, dur), info)
 
 
 # ---------------------------------------------------------------- 摘要錯誤輸出
@@ -648,9 +939,8 @@ class Ctx:
     def tool_raw(self, vid, argv, cwd=None, env=None, stdin_bytes=None):
         """→ (status, rc, 原始輸出, 秒數, 本次上限)。給需要自己解析輸出的逐檔驗證器用。"""
         limit = self.timeout_for(vid)
-        status, rc, text, dur = run_tool(argv, str(cwd or self.project), limit,
-                                         env=env, stdin_bytes=stdin_bytes)
-        return status, rc, text, dur, limit
+        r = run_tool(argv, str(cwd or self.project), limit, env=env, stdin_bytes=stdin_bytes)
+        return ToolRun(tuple(r) + (limit,), getattr(r, "info", None))
 
     def result_from(self, vid, label, status, rc, text, dur, limit, argv):
         if status == "ok":
@@ -665,11 +955,14 @@ class Ctx:
 
     def tool(self, vid, label, argv, cwd=None, env=None, stdin_bytes=None,
              fail_detect=None):
-        status, rc, text, dur, limit = self.tool_raw(vid, argv, cwd, env, stdin_bytes)
+        raw = self.tool_raw(vid, argv, cwd, env, stdin_bytes)
+        status, rc, text, dur, limit = raw
         # fail_detect 只能在「跑完了」的兩種結果之間改判;逾時/缺工具/錯誤不可能被改成通過。
         if status in ("ok", "fail") and fail_detect is not None:
             status = "fail" if fail_detect(rc, text) else "ok"
-        return self.result_from(vid, label, status, rc, text, dur, limit, argv)
+        res = self.result_from(vid, label, status, rc, text, dur, limit, argv)
+        res.meta.update(getattr(raw, "info", {}))       # pid、結束原因、有沒有留下背景程序
+        return res
 
     def budget_stop(self, vid, label, t0):
         """程序內的檢查(JSON/XML/xlsx)在檔案之間發現預算用盡。"""
@@ -2409,6 +2702,8 @@ def main(data, fallback=False):
     notes = []
     cfg = load_config(project, notes)
     _SCAN_CAP[0] = int(cfg["dep_scan_cap"])
+    _RUN["reap"] = bool(cfg["kill_leftover_processes"])
+    _RUN["project"] = project
     chash = config_hash(cfg)
     state = {} if fallback else load_state(project)
     session = str(data.get("session_id") or "")
@@ -2510,6 +2805,7 @@ def main(data, fallback=False):
 
 def entry():
     install_signal_handlers()
+    _record_parent()
     data = read_input()
     try:
         main(data)
