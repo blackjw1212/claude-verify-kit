@@ -147,7 +147,7 @@ def test_l2_reaped_leftovers_are_logged(project, tmp_path):
     run_hook(project)
     bg = int(_wait_file(pidfile)[0])
     _cleanup([bg])
-    res = log(project)[-1]["results"][0]
+    res = next(x for x in log(project)[-1]["results"] if x["id"] == "override")  # Final:累加模式下內建檢查也在結果裡,按 id 取自訂驗證那一筆
     assert res.get("leftovers") is True
 
 
@@ -185,7 +185,7 @@ def test_l3_hook_stops_its_tools_when_its_parent_dies(project, tmp_path):
 def test_l4_log_records_pid_duration_and_end_reason(project):
     write(project, ".claude/verify.py", "import sys\nprint('x')\nsys.exit(3)\n")
     run_hook(project)
-    res = log(project)[-1]["results"][0]
+    res = next(x for x in log(project)[-1]["results"] if x["id"] == "override")  # Final:累加模式下內建檢查也在結果裡,按 id 取自訂驗證那一筆
     assert isinstance(res["pid"], int) and res["pid"] > 0
     assert res["sec"] >= 0 and res["end"] == "exit"
 
@@ -194,7 +194,7 @@ def test_l4_timeout_end_reason(project):
     write(project, ".claude/verify.py", "import time\ntime.sleep(30)\n")
     configure(project, validators={"override": {"timeout": 1}})
     run_hook(project)
-    res = log(project)[-1]["results"][0]
+    res = next(x for x in log(project)[-1]["results"] if x["id"] == "override")  # Final:累加模式下內建檢查也在結果裡,按 id 取自訂驗證那一筆
     assert res["end"] == "timeout_killed" and isinstance(res["pid"], int)
 
 
@@ -202,7 +202,7 @@ def test_l4_timeout_end_reason(project):
 def test_l4_signal_end_reason(project):
     write(project, ".claude/verify.py", "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n")
     run_hook(project)
-    res = log(project)[-1]["results"][0]
+    res = next(x for x in log(project)[-1]["results"] if x["id"] == "override")  # Final:累加模式下內建檢查也在結果裡,按 id 取自訂驗證那一筆
     assert res["end"] == "signal 9"
 
 
@@ -226,7 +226,7 @@ def test_l5_terminated_hook_takes_its_job_down_on_windows(project, tmp_path):
 def test_l5_job_object_is_used_on_windows(project):
     write(project, ".claude/verify.py", "print('ok')\n")
     run_hook(project)
-    assert log(project)[-1]["results"][0].get("job") is True
+    assert next(x for x in log(project)[-1]["results"] if x["id"] == "override").get("job") is True
 
 
 # ---------------------------------------------------------------- L1 的延伸

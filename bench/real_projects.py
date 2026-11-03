@@ -79,11 +79,19 @@ def suite_site(work, args):
     py = s.proj / ".claude" / "hooks" / "loop-gate.py"
     py_orig = py.read_text(encoding="utf-8")
     py.write_text(py_orig + "\ndef broken(:\n", encoding="utf-8")
-    r = s.step("Python:.claude/hooks/loop-gate.py 語法錯誤(verify.sh 不檢查 Python)", "pass", "override", "run")
-    s.notes.append("發現:專案有自訂驗證時,內建檢查(含 Python 語法)全部不跑 —— 這是 Stage 1 起的設計"
-                   "(自訂驗證取代內建)。網站的 verify.sh 不檢查 Python,所以 .claude/hooks/*.py 的語法錯誤會被放行。"
-                   f"這一步的裁決:{r['verdict']}")
+    # Final Acceptance 起預設 custom_verify_mode=augment:verify.sh 照跑,內建的 Python 語法檢查也跑
+    s.step("Python:.claude/hooks/loop-gate.py 語法錯誤(verify.sh 不檢查 Python,內建檢查擋下)", "block", "python",
+           "run", reason_has=".claude/hooks/loop-gate.py:")
+    rt.configure(s.proj, custom_verify_mode="replace")
+    s.step("同一個錯誤 + 明確設定 custom_verify_mode=replace(舊行為:只跑 verify.sh)", "pass", "override", "run")
+    (s.proj / ".claude" / "verify.json").unlink()
     py.write_text(py_orig, encoding="utf-8")
+    settings = s.proj / ".claude" / "settings.json"
+    st_orig = settings.read_text(encoding="utf-8")
+    settings.write_text(st_orig.replace("loop-gate.py", "loop-gate-missing.py", 1), encoding="utf-8")
+    s.step("hooks 設定指向不存在的腳本", "block", "hooks", "run", reason_has="loop-gate-missing.py")
+    settings.write_text(st_orig, encoding="utf-8")
+    s.step("還原 hooks 設定", "pass", "hooks", "run")
     configure = rt.configure
     configure(s.proj, max_lines=10)
     s.step("設定檔:新增 .claude/verify.json", "pass", "override", "run")

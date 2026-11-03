@@ -264,7 +264,9 @@ def _green_json(project, env):
 
 def _full_check_happened(project):
     res = next(r for r in last_log(project)["results"] if r["id"] == "json")
-    return not fast_pathed(project) and res.get("checked") == 2 and res.get("cached") == 0
+    # Final 起 .claude/*.json 也檢查:有 verify.json 時要多算一個
+    expected = 2 + int((project / ".claude" / "verify.json").exists())
+    return not fast_pathed(project) and res.get("checked") == expected and res.get("cached") == 0
 
 
 @pytest.mark.parametrize("damage", ["delete", "empty", "truncate", "not-json", "missing-fields",

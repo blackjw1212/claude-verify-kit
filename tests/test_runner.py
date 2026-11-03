@@ -96,7 +96,7 @@ def test_timeout_warns_only_when_explicitly_configured_kills_tree_and_is_logged(
     assert not alive(bg)  # 背景孫程序也被收掉了
     rec = read_log(project)[-1]
     assert rec["suspect"] == ["override"]
-    res = rec["results"][0]
+    res = next(x for x in rec["results"] if x["id"] == "override")  # Final:累加模式下內建檢查也在結果裡,按 id 取自訂驗證那一筆
     # 記錄逾時工具、執行時間、上限、成因、處置
     assert res["id"] == "override" and res["status"] == "timeout"
     assert res["cmd"].startswith("sh ") and res["cmd"].endswith("verify.sh")
@@ -119,7 +119,7 @@ def test_global_budget_bounds_total_time(project):
     r = run_hook(project)
     assert r.elapsed < 12, r
     assert r.blocked and "逾時" in r.reason
-    res = read_log(project)[-1]["results"][0]
+    res = next(x for x in read_log(project)[-1]["results"] if x["id"] == "override")  # Final:累加模式下內建檢查也在結果裡,按 id 取自訂驗證那一筆
     assert res["cause"] == "budget_limited"   # 是整體預算不夠,不是驗證器自己的上限
 
 
@@ -133,7 +133,8 @@ def test_timeout_is_never_recorded_as_success(project):
     cache = json.loads((project / ".claude/.verify_cache.json").read_text(encoding="utf-8"))
     assert cache["ok_fp"] is None                     # 沒有寫入「上次全綠」
     rec = read_log(project)[-1]
-    assert [x["status"] for x in rec["results"]] == ["timeout"]
+    assert [x["status"] for x in rec["results"] if x["id"] == "override"] == ["timeout"]  # Final:累加模式下內建檢查也在結果裡,按 id 取自訂驗證那一筆
+    assert all(x["status"] == "pass" for x in rec["results"] if x["id"] != "override")  # 其餘只有 verify.json 的 JSON 檢查
     r2 = run_hook(project)                          # 沒有任何變更也必須重跑,不可走快速路徑
     assert len(read_log(project)) == 2 and r2.elapsed >= 0.9
 

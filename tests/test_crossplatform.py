@@ -217,7 +217,7 @@ def test_x5_timeout_kills_the_whole_tree_on_this_platform(project, tmp_path):
     while pid_alive(gc) and time.monotonic() < deadline:
         time.sleep(0.1)
     assert not pid_alive(gc), f"孫程序 {gc} 還活著"
-    res = log(project)[-1]["results"][0]
+    res = next(x for x in log(project)[-1]["results"] if x["id"] == "override")  # Final:累加模式下內建檢查也在結果裡,按 id 取自訂驗證那一筆
     assert res["status"] == "timeout" and res["action"] == "killed_process_tree"
 
 
@@ -225,7 +225,7 @@ def test_x5_normal_exit_of_a_tool_is_a_pass(project):
     write(project, ".claude/verify.py", "print('ok')\n")
     r = run_hook(project)
     assert not r.blocked
-    assert log(project)[-1]["results"][0]["status"] == "pass"
+    assert next(x for x in log(project)[-1]["results"] if x["id"] == "override")["status"] == "pass"
 
 
 # ---------------------------------------------------------------- X6 exit code 傳遞

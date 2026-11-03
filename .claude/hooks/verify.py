@@ -132,6 +132,9 @@ DEFAULT_CONFIG = {
     "debug": False,                 # 或環境變數 CLAUDE_VERIFY_DEBUG=1:把跳過/沿用的理由寫進紀錄
     "dep_scan_cap": 300000,         # 相依目錄(node_modules…)逐檔掃描的上限;超過 → 該驗證器每次都跑
     "kill_leftover_processes": True,  # 工具結束後收掉它留下的背景程序;False = Stage 2 的行為(不收)
+    # 有 .claude/verify* 時:augment = 自訂驗證每次都跑,內建檢查照各自的快取規則照跑,任一邊失敗都擋;
+    # replace = 只跑自訂驗證(Stage 1–3 的行為,要明確設定才會生效)。
+    "custom_verify_mode": "augment",
     "validators": {},               # {"<id>": {"timeout": 秒, "on_missing": ..., "on_timeout": ...}}
 }
 
@@ -233,6 +236,10 @@ def load_config(project, notes):
         elif key == "block_mode":
             if val not in ("json", "exit2"):
                 bad(key, "必須是 json / exit2")
+                continue
+        elif key == "custom_verify_mode":
+            if val not in ("augment", "replace"):
+                bad(key, "必須是 augment / replace(不認得的值一律當成 augment)")
                 continue
         elif key in BOOL_KEYS:
             if not isinstance(val, bool):
@@ -1031,7 +1038,7 @@ RACY_NS = 2 * 10 ** 9
 VALIDATOR_VERSIONS = {
     "firmware": 1, "plist": 1, "opencore": 1, "acpi": 1, "xml": 1, "json": 1,
     "adblock": 1, "xlsx": 1, "shell": 1, "python": 1, "pytest": 1, "node": 1,
-    "rust": 1, "override": 1,
+    "rust": 1, "override": 1, "hooks": 1,
 }
 # 重型:會吃滿 CPU 的建置/測試,同時最多跑 max_heavy 個(預設 1),避免互搶到逾時。
 HEAVY = {"firmware", "rust", "node", "pytest", "override"}
@@ -1792,6 +1799,100 @@ def run_python_syntax(ctx, rels):
                        summarize(text, ctx.cfg["max_lines"], ctx.project), rc, dur)]
 
 
+# ---- Claude Code 的 hooks 設定(.claude/settings.json、settings.local.json)
+#
+# 形狀錯的 hooks 設定可能整段被忽略,驗證閘門會安靜地消失;指向不存在的腳本則是每次都失敗。
+# 只檢查官方文件寫明的結構:hooks → 事件 → [{matcher?, hooks: [{type, command?, timeout?}]}]。
+# 事件名稱與 type 的種類不檢查(新版會增加),只要求型別正確。JSON 本身壞掉由 json 驗證器回報。
+_PROJECT_REF_RE = re.compile(r"(?:\$\{CLAUDE_PROJECT_DIR\}|\$CLAUDE_PROJECT_DIR|%CLAUDE_PROJECT_DIR%)[/\\]"
+                             r"([^\"'\s;|&<>]+)")
+_REL_REF_RE = re.compile(r"(?:^|[\s\"'])(\.claude[/\\][^\"'\s;|&<>]+)")
+
+
+def _line_of(text, needle):
+    i = text.find(needle) if needle else -1
+    return text.count("\n", 0, i) + 1 if i >= 0 else 1
+
+
+def _check_hook_settings(project, rel, text):
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []                                    # 由 json 驗證器回報
+    if not isinstance(data, dict) or "hooks" not in data:
+        return []
+    errs = []
+
+    def err(needle, msg):
+        errs.append(f"{rel}:{_line_of(text, needle)}: {msg}")
+    hooks = data["hooks"]
+    if not isinstance(hooks, dict):
+        err('"hooks"', "hooks 必須是物件(事件名稱 → 陣列)")
+        return errs
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            err(f'"{event}"', f"hooks.{event} 必須是陣列")
+            continue
+        for gi, g in enumerate(groups):
+            where = f"hooks.{event}[{gi}]"
+            if not isinstance(g, dict):
+                err(f'"{event}"', f"{where} 必須是物件")
+                continue
+            if "matcher" in g and not isinstance(g["matcher"], str):
+                err('"matcher"', f"{where}.matcher 必須是字串")
+            inner = g.get("hooks")
+            if not isinstance(inner, list):
+                err(f'"{event}"', f"{where} 缺少 hooks 陣列(或不是陣列)")
+                continue
+            for hi, h in enumerate(inner):
+                w = f"{where}.hooks[{hi}]"
+                if not isinstance(h, dict) or not isinstance(h.get("type"), str):
+                    err(f'"{event}"', f"{w} 必須是物件,而且要有字串型別的 type")
+                    continue
+                t = h.get("timeout")
+                if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or t <= 0):
+                    err('"timeout"', f"{w}.timeout 必須是正數(秒)")
+                if h["type"] != "command":
+                    continue
+                cmd = h.get("command")
+                if not isinstance(cmd, str) or not cmd.strip():
+                    err(f'"{event}"', f"{w} 是 command 型別卻沒有 command 字串")
+                    continue
+                refs = _PROJECT_REF_RE.findall(cmd) + _REL_REF_RE.findall(cmd)
+                for ref in refs:
+                    path = project / ref.replace("\\", "/")
+                    if not path.exists():
+                        err(cmd, f"{w} 指向的檔案不存在:{ref.replace(chr(92), '/')}")
+    return errs
+
+
+def _hooks_ident(ctx):
+    """結果取決於設定檔「指向的腳本」存不存在:把那些路徑的 stat 簽章算進工具識別,
+    腳本被刪、被換,設定檔沒動也會重驗(只用設定檔內容當快取鍵會沿用舊的通過)。"""
+    refs = set()
+    for rel in CLAUDE_SETTINGS:
+        try:
+            text = (ctx.project / rel).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for rx in (_PROJECT_REF_RE, _REL_REF_RE):
+            refs.update(r.replace("\\", "/") for r in rx.findall(text))
+    return "builtin-hooks-1|" + ",".join(f"{r}={path_sig(ctx.project / r)}" for r in sorted(refs))
+
+
+def run_hook_settings(ctx, rels):
+    outcomes = {}
+    for rel in rels:
+        try:
+            text = (ctx.project / rel).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as e:
+            outcomes[rel] = ("fail", [f"{rel}: 讀不到({clip(str(e), 120)})"])
+            continue
+        errs = _check_hook_settings(ctx.project, rel, text)
+        outcomes[rel] = ("fail", errs) if errs else ("pass", [])
+    return outcomes, []
+
+
 # ---- 逐檔驗證器的工具識別:回傳 (識別字串, None) 或 (None, 缺工具的 Result)
 
 def _exe_tool(vid, label, exe, extra=lambda ctx: ""):
@@ -1839,6 +1940,8 @@ FILE_VALIDATORS = {
               _exe_tool("shell", "shellcheck", "shellcheck",
                         lambda ctx: _rc_digest(ctx, ".shellcheckrc", "shellcheckrc"))),
     "python": ("Python 語法", ("*.py",), run_python_syntax, _python_tool),
+    "hooks": ("Claude Code hooks 設定", (), lambda ctx, rels: run_hook_settings(ctx, rels),
+              lambda ctx: (_hooks_ident(ctx), None)),
 }
 
 
@@ -2322,9 +2425,24 @@ BUILTIN_CHECKS = [
 # 有快取的流程用的順序(結果也照這個順序回報)。
 PIPELINE = [
     ("firmware", spec_firmware), ("plist", None), ("opencore", spec_opencore), ("acpi", None),
-    ("xml", None), ("json", None), ("adblock", spec_adblock), ("xlsx", None), ("shell", None),
+    ("xml", None), ("json", None), ("hooks", None), ("adblock", spec_adblock), ("xlsx", None), ("shell", None),
     ("python", None), ("pytest", spec_pytest), ("node", spec_node), ("rust", spec_rust),
 ]
+OVERRIDE_IDX = len(PIPELINE)
+
+# 內建檢查走訪檔案時整棵略過 .claude/(狀態檔、外掛快取都在那裡),但其中有兩類是會讓閘門失效的程式與設定:
+# hook 程式碼(.claude/*.py、.claude/hooks/*.py)與 Claude Code 的設定(.claude/*.json)。這兩類照樣檢查。
+CLAUDE_SETTINGS = (".claude/settings.json", ".claude/settings.local.json")
+
+
+def claude_targets(vid, extras):
+    if vid == "python":
+        return [r for r in extras if r.endswith(".py")]
+    if vid == "json":
+        return [r for r in extras if r.endswith(".json")]
+    if vid == "hooks":
+        return [r for r in extras if r in CLAUDE_SETTINGS]
+    return []
 
 
 # ---------------------------------------------------------------- 專案自訂標準(override)
@@ -2383,13 +2501,16 @@ def collect_specs(ctx, override=None):
       errors:  {idx: [Result(error)]}  —— 建立規格時就出錯的驗證器"""
     entries, errors = [], {}
     if override is not None:
-        entries.append(("project", 0, "override", spec_override(ctx, override)))
-        return entries, errors
+        # 排在所有內建檢查之後(結果與原因也照這個順序)
+        entries.append(("project", OVERRIDE_IDX, "override", spec_override(ctx, override)))
+        if ctx.cfg["custom_verify_mode"] == "replace":
+            return entries, errors
+    extras = claude_extras(ctx.project)
     for idx, (vid, spec_fn) in enumerate(PIPELINE):
         try:
             if spec_fn is None:
                 label, patterns, runner, ident = FILE_VALIDATORS[vid]
-                targets = ctx.glob_rel(*patterns)
+                targets = ctx.glob_rel(*patterns) + claude_targets(vid, extras)
                 if not targets:
                     continue
                 tool_id, missing = ident(ctx)

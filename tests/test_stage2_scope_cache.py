@@ -154,7 +154,8 @@ def test_cache_false_rechecks_everything(project, fake):
     write(project, "0.json", '{"x": 1}')
     run_hook(project, env=fake.env)
     res = next(r for r in last_log(project)["results"] if r["id"] == "json")
-    assert res["checked"] == 3 and res["cached"] == 0
+    # 3 個專案 JSON + .claude/verify.json(Final 起 .claude/*.json 也檢查)
+    assert res["checked"] == 4 and res["cached"] == 0
 
 
 def test_corrupt_cache_is_ignored(project, fake):
