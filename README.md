@@ -87,11 +87,11 @@ Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":
 
 原則：**寧可多花幾秒重新驗證，也不能因為快取把失敗的專案判定為通過。**快取只在「檔案內容」和「環境」都沒變時才沿用；任何一項追不到，就當成變了。
 
-- **變更怎麼判定**：比對檔案內容雜湊（`.claude/.verify_cache.json`），不是 transcript 也不是 git。transcript 看不到 Bash 改的檔，官方文件也說它在 Stop 當下可能還沒寫完；git status 列的是所有未 commit 的變更，也看不到被 `.gitignore` 排除、但驗證器照樣會檢查的檔案。只 `touch`、內容沒變不算變更。
+- **變更怎麼判定**：比對檔案內容的 SHA-256（`.claude/.verify_cache.json`），不是 transcript 也不是 git。transcript 看不到 Bash 改的檔，官方文件也說它在 Stop 當下可能還沒寫完；git status 列的是所有未 commit 的變更，也看不到被 `.gitignore` 排除、但驗證器照樣會檢查的檔案。只 `touch`、內容沒變不算變更。
 - **環境也算變更**（全綠快速路徑與防迴圈都看它）：
-  - 工具執行檔本身（實際路徑、大小、mtime；symlink 換目標也算）。
-  - 被 `SKIP_DIRS` 排除的相依目錄：`node_modules`、`managed_components`、`.pio/libdeps`、專案直譯器的所有 site-packages（含 venv 與使用者 site），逐檔比對大小與 mtime，就地改套件也抓得到。
-  - 工具鏈：PlatformIO 的 `packages/`、`platforms/`（`PLATFORMIO_CORE_DIR`）、ESP-IDF 的 `IDF_PATH`、版本檔、PATH 上的 xtensa/riscv 編譯器、`IDF_TOOLS_PATH`、rustup（`RUSTUP_TOOLCHAIN`、`settings.toml`、toolchains）、Arduino 核心與 sketchbook 函式庫。
+  - 工具執行檔本身（實際路徑、大小、mtime、ctime、inode；symlink 換目標也算）。
+  - 被 `SKIP_DIRS` 排除的相依目錄：`node_modules`、`managed_components`、`.pio/libdeps`、專案直譯器的所有 site-packages（含 venv 與使用者 site），逐檔比對大小、mtime、ctime、inode，就地改套件也抓得到。
+  - 工具鏈：PlatformIO 的 `packages/`、`platforms/`（`PLATFORMIO_CORE_DIR`；平台建置腳本與所有 `framework-*` 套件逐檔追蹤）、ESP-IDF 的 `IDF_PATH`（版本檔，加上 `components/`、`tools/` 逐檔追蹤）、IDF 自己的 Python 環境（`IDF_PYTHON_ENV_PATH`）、PATH 上的 xtensa/riscv 編譯器、`IDF_TOOLS_PATH`、rustup（`RUSTUP_TOOLCHAIN`、`settings.toml`、toolchains）、Arduino 核心（`packages/*/hardware/*/*` 逐檔追蹤）與 sketchbook 函式庫。**就地修補框架原始碼**（例如改了 ESP-IDF 某個元件）也會重建。
   - 相關環境變數（`IDF_*`、`PLATFORMIO_*`、`PYTHONPATH`、`NODE_OPTIONS`…），以及 `.claude/verify.json` 的設定雜湊（設定改了，所有快取作廢）。
   - 相依目錄超過 `dep_scan_cap`（預設 30 萬個檔）、或問不到直譯器的套件目錄 → 那個驗證器每次都跑。
 - **逐檔驗證器**（JSON、XML、plist、ACPI、xlsx、shellcheck、Python 語法）：只驗內容變了的檔案，其餘沿用上次的結果，**包括上次的失敗**。
@@ -100,12 +100,15 @@ Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":
   - `any`：任何專案檔案變更都重跑。適用 pytest、npm、cargo、aglint，以及用了 `file(GLOB)`、`configure_file` 的韌體專案。
   - `always`：每次都跑，也不走全綠快速路徑。適用三種情況：建置會執行任意程式（`execute_process`、`add_custom_command`、FetchContent、PlatformIO `extra_scripts`）；引用專案外的路徑（`include()`、`EXTRA_COMPONENT_DIRS`、`add_subdirectory`、`lib_extra_dirs`、`-I`、`lib_deps = file://`、嵌入檔）；或路徑含無法解析的變數。`${CMAKE_CURRENT_SOURCE_DIR}` 等已知變數，以及同檔 `set()` 的字面值，會先代換。
   - 任何檔案被刪除時，`precise` 模式也重建。
-- **自訂驗證 `.claude/verify*`**：預設每次都跑（`override_cache: false`），因為它讀什麼、依賴什麼無從得知。設成 `true` 會把常見工具、PATH、相依目錄與工具鏈都算進環境，沒變就不重跑。
-- **快取本身的安全**：快取檔有校驗碼，並記錄所在目錄、格式版本、kit 版本、設定雜湊。任一項不符（截斷、寫壞、欄位型別錯、手改、從別的目錄複製來）→ 整份作廢、完整驗證。全綠紀錄和快取存在同一個檔、同一次原子寫入，所以刪掉或寫壞快取，就不會走快速路徑。狀態檔的欄位型別也會檢查。hook 若仍在第一次執行時崩潰，會改用「不含快取」的完整驗證重試；兩次都失敗才放行，而且使用者看得到。**限制**：校驗碼擋不住「改完連校驗碼一起重算」的刻意竄改，因為 hook 與被它管的程序權限相同。
-- **並行與終止**：多個 hook 同時跑時，快取用原子替換寫入；結果以內容雜湊為鍵，舊的寫入不會套到不同的內容上。hook 被 SIGTERM／SIGINT 終止時，會先收掉整棵子程序樹；SIGKILL 攔不到，子程序會留著，但快取不會被寫入。
+- **自訂驗證 `.claude/verify*`**：預設每次都跑（`override_cache: false`），因為它讀什麼、依賴什麼無從得知。設成 `true` 會把常見工具、相依目錄、工具鏈與**整份環境變數**（`CC`、`CFLAGS` 之類都算；只存雜湊，值不落地）算進環境，沒變就不重跑。注意：有自訂驗證時，內建檢查（JSON、Python 語法…）**全部不跑**，自訂驗證要自己涵蓋它們。
+- **快取本身的安全**：快取檔有 SHA-256 校驗碼，並記錄所在目錄、格式版本（目前 2）、kit 版本、設定雜湊。任一項不符（截斷、寫壞、欄位型別錯、手改、從別的目錄複製來）→ 整份作廢、完整驗證。全綠紀錄和快取存在同一個檔、同一次原子寫入，所以刪掉或寫壞快取，就不會走快速路徑。狀態檔的欄位型別也會檢查。hook 若仍在第一次執行時崩潰，會改用「不含快取」的完整驗證重試；兩次都失敗才放行，而且使用者看得到。**信任邊界**：校驗碼擋不住「改完連校驗碼一起重算」的刻意竄改（實測過：重算後的偽造快取會被接受），因為 hook 與被它管的程序權限相同——能這樣做的人也能改 `verify.json` 或建立 `skip-verify`。要防模型自己動這些檔，請在專案的 `.claude/settings.json` 加拒絕規則（見下方「保護驗證設定」）。
+- **並行與終止**：多個 hook 同時跑時，快取用原子替換寫入（Windows 上目標檔被別的程序開著時會短暫重試）；結果以內容雜湊為鍵，舊的寫入不會套到不同的內容上。hook 不論怎麼結束都不留孤兒程序：SIGTERM／SIGINT 由訊號處理器收掉整棵子程序樹；SIGKILL（包括整個程序群組被 SIGKILL）由外部看門程序收掉（POSIX）、由 Job Object 收掉（Windows）。hook 的父程序（Claude Code）死掉時，hook 會停掉工具、不寫快取、直接結束。工具正常結束後留下的背景程序也會被收掉（`kill_leftover_processes: false` 可關）。被終止的那一次一定不會寫入快取。
 - **平行**：彼此獨立的驗證器同時跑，最多 `max_parallel` 個，其中重型最多 `max_heavy` 個（預設 1）。
-- **已知限制**：內容改了，但大小與 mtime 都被刻意還原成很久以前，預設模式看不到（與 git index 相同）；要嚴格請設 `"trust_mtime": false`。工具鏈與相依目錄是用「目錄清單＋關鍵檔的大小／mtime」或「逐檔大小／mtime」追蹤，沒有讀內容。
-- **相關設定**（`.claude/verify.json`）：`max_parallel`、`max_heavy`、`cache`、`override_cache`、`trust_mtime`、`dep_scan_cap`、`debug`（或環境變數 `CLAUDE_VERIFY_DEBUG=1`）。
+- **已知限制**：
+  - Windows 上，內容改了但大小與 mtime 都被還原（`touch -r`、`robocopy` 之類），預設模式看不到——Windows 的 `st_ctime` 是建立時間，沒有可用的變更時間。POSIX 上 ctime 會擋下這種情況。要完全保險請設 `"trust_mtime": false`。
+  - 被略過的目錄（`dist/`、`build/`、`.cache/`…）裡的檔案，只有被建置設定明確引用時才會追蹤；測試若讀取那些目錄，請設 `"cache": false`。
+  - 工具鏈與相依目錄是用「逐檔大小／mtime／ctime／inode」追蹤，沒有讀內容。
+- **相關設定**（`.claude/verify.json`）：`max_parallel`、`max_heavy`、`cache`、`override_cache`、`trust_mtime`、`dep_scan_cap`、`kill_leftover_processes`、`debug`（或環境變數 `CLAUDE_VERIFY_DEBUG=1`）。紀錄檔 `.claude/.verify.log` 的每個工具結果會寫 `pid`、耗時、結束原因（`exit`／`signal N`／`timeout_killed`）。
 - **效能**：`python3 bench/benchmark.py`，結果見下表。
 
 合成專案 719 個檔案，CPU 4 核，每格為中位數，單位秒。韌體建置用固定 3 秒的假 `pio`；「未重建」表示那一次根本沒有呼叫建置工具。
@@ -124,6 +127,45 @@ Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":
 
 自訂驗證（`.claude/verify.sh`）的實際專案：`override_cache: false`（預設）每次約 16.5 s；設成 `true`，無變更時約 0.13 s。
 
+Stage 3（SHA-256、ctime／inode、看門程序）對 Stage 2 驗收後（`2f94628`），5 萬個專案檔＋4 萬個 `node_modules` 檔，各 20 次的中位數：
+
+| 情境 | Stage 2 驗收後 | Stage 3 |
+|---|---|---|
+| 無變更 | 1.68 | 1.80 |
+| 改一個 JSON（pytest、node 是 any 模式，也會重跑） | 5.99 | 6.46 |
+| 多檔（5 種驗證器並行） | 6.58 | 7.14 |
+| 工具版本變更 | 2.83 | 3.21 |
+| 刪掉快取（完整重驗） | 6.69 | 7.03 |
+| 冷啟動 | 8.11 | 7.73 |
+
+兩版的重建行為完全相同；Stage 3 多出的 5–13% 是快取檔變大（5.44 → 8.65 MB）與逐檔多比 ctime／inode 的成本。完整數據（P95、CPU、峰值記憶體、子程序數）：`python3 bench/stage3_perf.py`。
+
+
+### 保護驗證設定（建議）
+
+快取的校驗碼只防意外損毀與過期沿用。要讓模型不能用內建工具改掉驗證結果或關掉驗證，在專案的 `.claude/settings.json` 加：
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Edit(/.claude/.verify_cache.json)",
+      "Edit(/.claude/.verify_state.json)",
+      "Edit(/.claude/verify.json)",
+      "Edit(/.claude/skip-verify)"
+    ]
+  }
+}
+```
+
+依官方文件（Configure permissions），`/` 開頭的規則以專案設定所在的主工作目錄為錨點；`Edit` 拒絕規則涵蓋內建的檔案工具、Bash 裡被辨識的檔案指令（`cat`、`sed`、`tee`…）與重新導向，**但不涵蓋**自己開檔的任意子程序（例如一支 Python 腳本）。要作業系統層級的強制，請開 Claude Code 的 sandbox。`touch` 是否在被辨識的指令內，文件沒有列出（疑點）。
+
+## 跨平台 CI 與驗收工具
+
+- **CI**：`.github/workflows/tests.yml`，Ubuntu／Windows／macOS × Python 3.8／3.11／3.12／3.13，`fail-fast: false`，每格上傳 JUnit XML；另有 vermin 檢查 Python 3.8 相容性。假工具是 Python 實作、依平台產生 sh 或 `.cmd` 啟動器，所以絕大多數測試在 Windows 上也會跑，而且走的是真的 `.cmd` 執行路徑。只有 Windows 才有意義的測試在其他平台標成跳過（不是通過）。
+- **真實工具鏈**：`python3 bench/real_toolchains.py --work DIR`。在隔離目錄用真的 pip／npm／cargo／rustup／cmake／gcc／clang／shellcheck／PlatformIO／ESP-IDF 建置，逐步記錄裁決、是否真的重跑、驗證器結果與原因摘錄。需要網路，不進 CI。
+- **真實專案**：`python3 bench/real_projects.py --work DIR --src DIR --site PATH`。一律在隔離副本上做，原始目錄不寫入。
+- **效能**：`python3 bench/stage3_perf.py --revs 2f94628,WORKTREE --repeat 20`（5 萬專案檔＋4 萬 node_modules；中位數／P95、CPU、峰值記憶體、子程序數、快取大小）。
 
 ## Cross-Model 計劃審查（Claude ↔ Codex）
 
