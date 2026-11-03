@@ -56,7 +56,8 @@ PY
   chmod +x .claude/hooks/verify.py .claude/hooks/plan-review.py .claude/hooks/loop-gate.py 2>/dev/null || true
 
   touch .gitignore
-  for line in ".claude/.last_verify_ok" ".claude/skip-verify" ".claude/plan.md" \
+  for line in ".claude/.last_verify_ok" ".claude/.verify_state.json" ".claude/.verify.log" \
+              ".claude/skip-verify" ".claude/plan.md" \
               ".claude/loop.json" ".claude/.loop_state.json" ".claude/settings.json.bak.*" ".claude/hooks/__pycache__/"; do
     grep -qxF "$line" .gitignore || echo "$line" >> .gitignore
   done

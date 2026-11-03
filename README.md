@@ -69,9 +69,16 @@ touch .claude/skip-verify   # 用完刪掉
 
 ## 運作機制
 
-Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":...}`（Stop 事件用 top-level `decision`/`reason`，非 `hookSpecificOutput`）讓 Claude 續跑修正。防無限迴圈靠 `stop_hook_active`：第一次 Stop 被擋後 Claude 重跑修正，下一次 Stop 事件的 `stop_hook_active` 為 true，hook 立即 exit 0 放行 —— 每段工作只擋一次。
+Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":...}`（Stop 事件用 top-level `decision`/`reason`，非 `hookSpecificOutput`）讓 Claude 續跑修正；`.claude/verify.json` 設 `"block_mode": "exit2"` 則改用 exit 2 + stderr。
 
-> 注意：Claude Code **並無**固定的「連續 block 上限」數字；唯一可靠的防迴圈就是 hook 自己檢查 `stop_hook_active`（本 kit 已於 `verify.py` 第一步實作）。若 hook 不做此檢查，曾有回報導致無限迴圈跑到吃光整個 session。
+防無限迴圈（`verify.py`）：
+- Claude Code 在 hook 擋下後續跑時，下一次 Stop 的 `stop_hook_active` 為 true。此時若**上次擋下之後專案沒有任何修改**（檔案清單＋大小＋mtime 的指紋相同），hook 直接放行並用 `systemMessage` 告知使用者；**有修改**才重新驗證，仍失敗就再擋。
+- 同一輪最多連續擋 `max_consecutive_blocks` 次（預設 5），之後放行交還給人。
+- 舊行為（`stop_hook_active` 一律放行）可用 `"rerun_when_active": false` 找回。
+
+> 更正：舊版 README 寫「Claude Code 並無固定的連續 block 上限」——與官方文件不符。官方 Stop 章節寫明 Claude Code 有**連續 8 次續跑**的上限（可用 `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` 調整），每次 Claude 呼叫工具就重新計數。hook 自己檢查仍然必要：那個上限只是最後一道保險。
+
+工具不存在、逾時、真正失敗三者分開處理：只有真正失敗會擋；前兩者預設只警告（`on_missing` / `on_timeout` 可改成 `block`），逾時記在 `.claude/.verify.log` 並標為疑點。
 
 ## Cross-Model 計劃審查（Claude ↔ Codex）
 
