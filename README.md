@@ -193,9 +193,12 @@ SHA-256 證明的是「內容一致」，不是「是誰寫的」。能寫 `.cla
 
 | 真的建置／執行過（Linux） | 沒有實測 |
 |---|---|
-| Python venv＋pip＋pytest、系統 Python＋使用者 site、Node／npm／npx、Rust／cargo／rustup（toolchain 切換）、ShellCheck（版本切換）、CMake＋GCC／Clang、PlatformIO native、ESP-IDF v5.4.4（esp32） | ESP32 Arduino（arduino-cli）、PlatformIO＋espressif32、所有 Windows／macOS 工具鏈 |
+| Python venv＋pip＋pytest、系統 Python＋使用者 site、Node／npm／npx、Rust／cargo／rustup（toolchain 切換）、ShellCheck（版本切換）、CMake＋GCC／Clang、PlatformIO native、ESP-IDF v5.4.4（esp32） | ESP32 Arduino（arduino-cli 1.3.1 已核對檢查碼，但 esp32 core 依賴的 `arduino` packager 在 downloads.arduino.cc，驗收環境連不到）、PlatformIO＋espressif32、所有 Windows／macOS 工具鏈 |
+| 第三方專案（低權限使用者、建置與測試時無網路）：itsdangerous 2.2.0、chalk v6.0.1、cJSON v1.7.19、platform-native v1.2.1 hello-world | |
 
-驗收腳本：`bench/real_toolchains.py`、`bench/real_projects.py`（需要網路，不進 CI）。
+驗收腳本：`bench/real_toolchains.py`、`bench/real_projects.py`（需要網路，不進 CI；第三方專案用 `--phase prepare` 有網路安裝、`--phase run` 在無網路環境建置與測試）。
+
+**裝進既有專案時要知道**：預設的 `augment` 模式會照跑內建檢查，既有的 lint 債會在第一次 Stop 就擋下，而且只要那些檔案沒修，每次都擋（逐檔快取連失敗一起沿用）。實測 itsdangerous 2.2.0 與 cJSON v1.7.19 的上游 shell 腳本本來就有 shellcheck 警告。處理方式：修掉、在專案的 `.shellcheckrc` 停用特定代碼，或（有自訂驗證時）明確設 `custom_verify_mode: "replace"`。
 
 ### 保護驗證設定（建議）
 
