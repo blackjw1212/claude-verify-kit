@@ -73,9 +73,8 @@ def test_cache_from_the_previous_format_is_not_trusted(hook, project):
 
 # ---------------------------------------------------------------- 同大小、還原 mtime 的就地改寫
 
-@pytest.mark.xfail(WINDOWS, strict=True,
-                   reason="已知限制:Windows 的 os.stat 沒有「變更時間」(st_ctime 是建立時間),"
-                          "同大小又還原 mtime 的就地改寫看不出來;要完全保險請設 trust_mtime=false")
+# Final Acceptance 起:Windows 上預設(auto)不信任 stat、每次重算 SHA-256,所以這條在所有平台都必須通過。
+# (3-4 時它在 Windows 標 xfail(strict=True),限制消除後 strict 會讓它 XPASS 而紅 —— 那正是當初加 strict 的用意。)
 def test_same_size_rewrite_with_restored_mtime_is_detected(project):
     f = write(project, "a.json", GOOD)
     mt = _age(f)
@@ -100,8 +99,7 @@ def test_trust_mtime_false_detects_it_on_every_platform(project):
 
 def test_dependency_tree_rewrite_with_restored_mtime_is_detected(project, fake):
     # node_modules 這類相依目錄的深度簽章也一樣:套件檔被同大小改寫並還原 mtime
-    if WINDOWS:
-        pytest.xfail("同上:Windows 沒有變更時間")
+    # Final Acceptance 起所有平台都必須偵測到(Windows 的 auto 會連內容一起算)
     fake.make("npm")
     write(project, "package.json", json.dumps({"scripts": {"test": "x"}}))
     dep = write(project, "node_modules/left-pad/index.js", "module.exports = 1;\n")

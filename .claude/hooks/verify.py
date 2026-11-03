@@ -67,6 +67,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -128,7 +129,11 @@ DEFAULT_CONFIG = {
     "max_heavy": 1,                 # 其中重型(韌體建置、測試)最多幾個
     "cache": True,                  # False = 每次都驗全部(不沿用快取結果)
     "override_cache": False,        # True = 檔案與環境都沒變時不重跑自訂驗證(它讀什麼無從得知,預設不快取)
-    "trust_mtime": True,            # False = 每次重新雜湊所有檔案(最慢、最保守)
+    # 檔案沒變的判斷要不要信任 stat:
+    #   "auto" = 只在平台有「使用者改不回去的變更時間」時信任(POSIX 的 ctime);Windows 沒有 → 每次重算 SHA-256
+    #   True   = 一律信任 stat(快;Windows 上同大小、還原 mtime 的改寫會漏判 —— 明確接受這個風險才設)
+    #   False  = 一律重算,連超過 64 MB 的大檔也算(最慢、最保守)
+    "trust_mtime": "auto",
     "debug": False,                 # 或環境變數 CLAUDE_VERIFY_DEBUG=1:把跳過/沿用的理由寫進紀錄
     "dep_scan_cap": 300000,         # 相依目錄(node_modules…)逐檔掃描的上限;超過 → 該驗證器每次都跑
     "kill_leftover_processes": True,  # 工具結束後收掉它留下的背景程序;False = Stage 2 的行為(不收)
@@ -145,7 +150,7 @@ DEFAULT_TIMEOUTS = {
     "opencore": 60, "acpi": 60, "xml": 60, "json": 60,
 }
 POLICIES = ("warn", "block", "ignore")
-BOOL_KEYS = ("rerun_when_active", "cache", "override_cache", "trust_mtime", "debug", "kill_leftover_processes")
+BOOL_KEYS = ("rerun_when_active", "cache", "override_cache", "debug", "kill_leftover_processes")
 
 
 def is_debug(cfg):
@@ -236,6 +241,10 @@ def load_config(project, notes):
         elif key == "block_mode":
             if val not in ("json", "exit2"):
                 bad(key, "必須是 json / exit2")
+                continue
+        elif key == "trust_mtime":
+            if val not in (True, False, "auto") or isinstance(val, int) and not isinstance(val, bool):
+                bad(key, "必須是 \"auto\" / true / false")
                 continue
         elif key == "custom_verify_mode":
             if val not in ("augment", "replace"):
@@ -376,7 +385,7 @@ def _kill_tree(proc):
 #          job 裡的程序(工具與它的子孫)由系統一起結束。
 _ACTIVE = set()
 _ACTIVE_LOCK = threading.RLock()
-_RUN = {"reap": True, "project": None, "parent": None, "parent_handle": None}
+_RUN = {"reap": True, "project": None, "parent": None, "parent_handle": None, "trust": True}
 
 _WATCHDOG_SRC = r"""
 import os, signal, sys, time
@@ -619,10 +628,10 @@ def _proc_members(pgid):
             continue
         try:
             with open(f"/proc/{name}/stat", "rb") as fh:
-                stat = fh.read().rsplit(b")", 1)[1].split()
+                fields = fh.read().rsplit(b")", 1)[1].split()
         except (OSError, IndexError):
             continue
-        if len(stat) > 2 and stat[0] != b"Z" and int(stat[2]) == pgid:
+        if len(fields) > 2 and fields[0] != b"Z" and int(fields[2]) == pgid:
             n += 1
     return n
 
@@ -1044,8 +1053,17 @@ VALIDATOR_VERSIONS = {
 HEAVY = {"firmware", "rust", "node", "pytest", "override"}
 
 
-def _hash_file(path, size, mtime_ns, ctime_ns=0, ino=0):
-    if size > BIG_FILE:
+def manifest_trust(cfg, is_win=None):
+    """這次可不可以用 stat 判斷「檔案沒變」。auto:POSIX 的 ctime 在寫入時一定更新、一般使用者改不回去 →
+    可信;Windows 的 st_ctime 是建立時間,沒有可用的變更時間 → 不可信,每次重算 SHA-256。"""
+    v = cfg.get("trust_mtime", "auto")
+    if v is True or v is False:
+        return v
+    return not (IS_WIN if is_win is None else is_win)
+
+
+def _hash_file(path, size, mtime_ns, ctime_ns=0, ino=0, content=False):
+    if size > BIG_FILE and not content:
         return f"stat:{size}:{mtime_ns}:{ctime_ns}:{ino}"
     h = hashlib.sha256()
     try:
@@ -1092,7 +1110,8 @@ class Manifest:
                     and (old[4] - max(old[1], old[2])) >= RACY_NS):
                 h = old[5]
             else:
-                h = _hash_file(path, *stat4)
+                # 不信任 stat 時(Windows 的 auto、或 false)大檔也要真的讀內容,不能用 stat 代替雜湊
+                h = _hash_file(path, *stat4, content=not self.trust)
                 self.hashed += 1
             entries[rel] = stat4 + [now, h]
             if not valid_old:
@@ -1348,7 +1367,7 @@ _SCAN_CAP = [DEP_SCAN_CAP]   # main() 依設定 dep_scan_cap 覆寫
 def tree_sig(path, cap=None):
     """目錄底下每個檔案的(相對路徑, 大小, mtime)。超過上限回 UNTRACKABLE;不存在回 "-"。"""
     cap = _SCAN_CAP[0] if cap is None else cap
-    key = (str(path), cap)
+    key = (str(path), cap, _RUN["trust"])
     if key in _TREE_MEMO:
         return _TREE_MEMO[key]
     root = str(path)
@@ -1369,6 +1388,10 @@ def tree_sig(path, cap=None):
             # ctime / inode:同大小、還原 mtime 的就地改寫(套件管理器、tar 解壓)也看得到(POSIX)
             h.update(f"{rel}/{fn}\0{st.st_size}\0{st.st_mtime_ns}\0{st.st_ctime_ns}\0{st.st_ino}\n"
                      .encode("utf-8", "surrogateescape"))
+            if not _RUN["trust"] and stat.S_ISREG(st.st_mode):
+                # 不信任 stat(Windows 的 auto、或 trust_mtime=false):連內容一起算
+                h.update(_hash_file(os.path.join(dirpath, fn), st.st_size, st.st_mtime_ns,
+                                    st.st_ctime_ns, st.st_ino, content=True).encode())
             n += 1
             if n > cap:
                 over = True
@@ -2864,7 +2887,9 @@ def main(data, fallback=False):
     cache = _empty_cache("fallback") if fallback else load_cache(project, chash)
     if fallback:
         notes.append("hook 第一次執行時內部出錯(可能是快取或狀態檔損壞),這次不用快取、完整驗證")
-    manifest = Manifest(project, cache["manifest"], cfg["trust_mtime"]).scan(
+    trust = manifest_trust(cfg)
+    _RUN["trust"] = trust
+    manifest = Manifest(project, cache["manifest"], trust).scan(
         ctx.files() + claude_extras(project))
     ctx.manifest = manifest
     override = find_override(project)
@@ -2915,7 +2940,7 @@ def main(data, fallback=False):
 
     # 驗證器可能寫檔(例如 iasl 產生 .aml):重新掃一次,記下「驗證完之後」的狀態。
     ctx.reset_files()
-    after = Manifest(project, manifest.entries, cfg["trust_mtime"]).scan(
+    after = Manifest(project, manifest.entries, trust).scan(
         ctx.files() + claude_extras(project))
     fp_after = composite_fp(after, env_d)
     green = not blocking and not every_run and not any(r.status in ("timeout", "error") for r in results)
