@@ -1022,8 +1022,9 @@ def claude_extras(project):
 # 雜湊,不重讀(同 git index);但「上次觀察時才剛被改過」(racy,2 秒內)的一律重讀。
 
 CACHE_NAME = ".verify_cache.json"
-CACHE_FORMAT = 1
-BIG_FILE = 64 * 1024 * 1024     # 超過就不讀內容,只比大小與 mtime
+# 2(Stage 3-4):內容雜湊改為 SHA-256;manifest 每筆多記 ctime 與 inode。格式 1 的快取一律不信任。
+CACHE_FORMAT = 2
+BIG_FILE = 64 * 1024 * 1024     # 超過就不讀內容,只比 stat(大小、mtime、ctime、inode)
 RACY_NS = 2 * 10 ** 9
 
 # 驗證器邏輯版本:改了某個驗證器的判定方式就 +1,它的舊快取自動失效。
@@ -1036,10 +1037,10 @@ VALIDATOR_VERSIONS = {
 HEAVY = {"firmware", "rust", "node", "pytest", "override"}
 
 
-def _hash_file(path, size, mtime_ns):
+def _hash_file(path, size, mtime_ns, ctime_ns=0, ino=0):
     if size > BIG_FILE:
-        return f"stat:{size}:{mtime_ns}"
-    h = hashlib.blake2b(digest_size=16)
+        return f"stat:{size}:{mtime_ns}:{ctime_ns}:{ino}"
+    h = hashlib.sha256()
     try:
         with open(path, "rb") as fh:
             while True:
@@ -1053,7 +1054,12 @@ def _hash_file(path, size, mtime_ns):
 
 
 class Manifest:
-    """每個檔案的 [大小, mtime_ns, 觀察時間_ns, 內容雜湊]。"""
+    """每個檔案的 [大小, mtime_ns, ctime_ns, inode, 觀察時間_ns, SHA-256]。
+
+    trust_mtime=True 時,stat 四項都和上次相同(而且上次觀察時已經離修改超過 2 秒)才沿用上次的雜湊。
+    ctime 是 POSIX 的「狀態變更時間」:寫入一定會更新它,而且使用者改不回去 —— 所以同大小、
+    又用 touch -r / cp -p / tar 還原 mtime 的就地改寫也看得到。inode 抓得到「寫暫存檔再改名」的寫法。
+    Windows 的 st_ctime 是建立時間,沒有這層保護(已知限制;要完全保險設 trust_mtime=false)。"""
 
     def __init__(self, project, prev=None, trust_mtime=True):
         self.project = project
@@ -1072,19 +1078,19 @@ class Manifest:
                 st = os.stat(path)
             except OSError:
                 continue
-            size, mt = st.st_size, st.st_mtime_ns
+            stat4 = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino]
             old = self.prev.get(rel)
-            valid_old = isinstance(old, list) and len(old) == 4
-            if (self.trust and valid_old and old[0] == size and old[1] == mt and old[3]
-                    and (old[2] - old[1]) >= RACY_NS):
-                h = old[3]
+            valid_old = isinstance(old, list) and len(old) == 6
+            if (self.trust and valid_old and old[:4] == stat4 and old[5]
+                    and (old[4] - max(old[1], old[2])) >= RACY_NS):
+                h = old[5]
             else:
-                h = _hash_file(path, size, mt)
+                h = _hash_file(path, *stat4)
                 self.hashed += 1
-            entries[rel] = [size, mt, now, h]
+            entries[rel] = stat4 + [now, h]
             if not valid_old:
                 added.append(rel)
-            elif old[3] != h:
+            elif old[5] != h:
                 modified.append(rel)
         self.entries = entries
         self.added, self.modified = added, modified
@@ -1093,14 +1099,26 @@ class Manifest:
 
     def hash_of(self, rel):
         e = self.entries.get(rel)
-        return e[3] if e else None
+        return e[5] if e else None
+
+    def _outside_hash(self, rel):
+        """不在 manifest 裡(位於被略過的目錄,例如 dist/、build/)但被建置設定明確引用的檔案:
+        直接雜湊。不這樣做的話,它被改了也看不出來 —— 精確模式只比 manifest 裡的雜湊。"""
+        path = self.project / rel
+        try:
+            st = os.stat(path)
+        except OSError:
+            return "-"
+        if not os.path.isfile(path):
+            return "dir"
+        return _hash_file(path, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
 
     def digest(self, rels=None):
         h = hashlib.sha256(VERSION.encode())
         names = sorted(self.entries) if rels is None else sorted(rels)
         for rel in names:
             e = self.entries.get(rel)
-            h.update(f"{rel}\0{e[3] if e else '-'}\n".encode("utf-8", "surrogateescape"))
+            h.update(f"{rel}\0{e[5] if e else self._outside_hash(rel)}\n".encode("utf-8", "surrogateescape"))
         return h.hexdigest()
 
     def changes(self, limit=20):
@@ -1137,8 +1155,8 @@ def _valid_manifest(m):
     if not isinstance(m, dict):
         return False
     for k, v in m.items():
-        if not (isinstance(k, str) and isinstance(v, list) and len(v) == 4
-                and _is_int(v[0]) and _is_int(v[1]) and _is_int(v[2]) and isinstance(v[3], str)):
+        if not (isinstance(k, str) and isinstance(v, list) and len(v) == 6
+                and all(_is_int(x) for x in v[:5]) and isinstance(v[5], str)):
             return False
     return True
 
@@ -1278,7 +1296,7 @@ def exe_identity(name):
     real = os.path.realpath(path)
     try:
         st = os.stat(real)
-        return f"{path}->{real}|{st.st_size}|{st.st_mtime_ns}"
+        return f"{path}->{real}|{st.st_size}|{st.st_mtime_ns}|{st.st_ctime_ns}|{st.st_ino}"
     except OSError:
         return f"{path}->{real}"
 
@@ -1286,7 +1304,7 @@ def exe_identity(name):
 def path_sig(path):
     try:
         st = os.stat(path)
-        return f"{st.st_size}:{st.st_mtime_ns}"
+        return f"{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}:{st.st_ino}"
     except OSError:
         return "-"
 
@@ -1330,7 +1348,7 @@ def tree_sig(path, cap=None):
     if not os.path.isdir(root):
         _TREE_MEMO[key] = "-"
         return "-"
-    h = hashlib.blake2b(digest_size=16)
+    h = hashlib.sha256()
     n = 0
     over = False
     for dirpath, dirs, files in os.walk(root):
@@ -1341,14 +1359,16 @@ def tree_sig(path, cap=None):
                 st = os.lstat(os.path.join(dirpath, fn))
             except OSError:
                 continue
-            h.update(f"{rel}/{fn}\0{st.st_size}\0{st.st_mtime_ns}\n".encode("utf-8", "surrogateescape"))
+            # ctime / inode:同大小、還原 mtime 的就地改寫(套件管理器、tar 解壓)也看得到(POSIX)
+            h.update(f"{rel}/{fn}\0{st.st_size}\0{st.st_mtime_ns}\0{st.st_ctime_ns}\0{st.st_ino}\n"
+                     .encode("utf-8", "surrogateescape"))
             n += 1
             if n > cap:
                 over = True
                 break
         if over:
             break
-    res = UNTRACKABLE if over else f"{n}:{h.hexdigest()}"
+    res = UNTRACKABLE if over else f"{n}:{h.hexdigest()[:32]}"
     _TREE_MEMO[key] = res
     return res
 
@@ -2121,6 +2141,11 @@ def spec_firmware(ctx):
                     deps_sig(ctx, "managed_components"), f"libdeps={tree_sig(pr / '.pio' / 'libdeps')}",
                     env_sig(prefixes=("IDF_", "PLATFORMIO_", "ESP_IDF", "ARDUINO_"))])
     mode, rels, why = analyze_firmware(ctx)
+    # 建置設定明確引用、但位於被略過目錄(dist/、build/…)的檔案不在 manifest 裡:把它們的雜湊併進
+    # 環境簽章,全綠快速路徑與快取鍵才看得到它們被改(只放進快取鍵的話,快速路徑會先放行)。
+    outside = sorted(r for r in (rels or ()) if r not in ctx.manifest.entries)
+    if outside:
+        env += "|outside:" + ",".join(f"{r}={ctx.manifest._outside_hash(r)}" for r in outside[:200])
     mode, why = _with_env_mode(mode, why, env)
     return dict(vid="firmware", label=label, run=lambda: [ctx.tool("firmware", label, cmd)],
                 inputs=(mode, rels, why), env=env, cacheable=True)

@@ -112,10 +112,15 @@ def test_trust_mtime_false_catches_same_size_same_mtime_edit(project, fake):
 
 
 def test_known_limitation_trust_mtime_misses_old_same_size_same_mtime_edit(project, fake):
-    # 已知限制(與 git index 相同):內容改了但大小與 mtime 都被刻意還原成「很久以前」,
-    # 預設模式看不到。要嚴格請設 trust_mtime=false。這條測試是把限制寫成文件,不是期望行為。
+    # Stage 2 時的已知限制(與 git index 相同):內容改了但大小與 mtime 都被刻意還原成「很久以前」,
+    # 預設模式看不到。Stage 3-4 起 manifest 多比 ctime 與 inode:POSIX 的 ctime 在寫入時一定會更新、
+    # 使用者改不回去,所以 POSIX 上這個限制已經消除,這裡改成斷言「擋得下」。
+    # Windows 的 st_ctime 是建立時間,限制仍在 —— 照舊把它寫成文件(要嚴格請設 trust_mtime=false)。
     r = _same_size_same_mtime_edit(project, fake)
-    assert not r.blocked
+    if os.name == "nt":
+        assert not r.blocked
+    else:
+        assert r.blocked and "a.json" in r.reason
 
 
 def test_tool_upgrade_invalidates_per_file_cache(project, fake):
