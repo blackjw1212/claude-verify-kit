@@ -78,7 +78,10 @@ Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":
 
 > 更正：舊版 README 寫「Claude Code 並無固定的連續 block 上限」——與官方文件不符。官方 Stop 章節寫明 Claude Code 有**連續 8 次續跑**的上限（可用 `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` 調整），每次 Claude 呼叫工具就重新計數。hook 自己檢查仍然必要：那個上限只是最後一道保險。
 
-工具不存在、逾時、真正失敗三者分開處理：只有真正失敗會擋；前兩者預設只警告（`on_missing` / `on_timeout` 可改成 `block`），逾時記在 `.claude/.verify.log` 並標為疑點。
+工具不存在、逾時、真正失敗三者分開處理：
+- **真正失敗**：擋。
+- **逾時**：預設也擋——逾時代表沒驗完，絕不算通過。只有在 `.claude/verify.json` 明確設 `"on_timeout": "warn"`（全域或 `validators.<id>`）才改成只警告。逾時的工具、指令、執行秒數、上限、成因（驗證器上限／整體預算）與處置（已終止程序樹／未執行）記在 `.claude/.verify.log`，並標為疑點。
+- **工具不存在**：預設只警告（`systemMessage` 讓使用者看得到），`"on_missing": "block"` 可改成擋。注意：自訂驗證 `.claude/verify.sh` 的直譯器（`sh`）不存在時，整份 DoD 都沒跑；要嚴格請設 `validators.override.on_missing: "block"`。
 
 ## Cross-Model 計劃審查（Claude ↔ Codex）
 

@@ -64,12 +64,29 @@ def test_override_that_cannot_execute_is_visible(project):
 
 # ---------------------------------------------------------------- 逾時
 
+def read_log(project):
+    return [json.loads(x) for x in (project / ".claude/.verify.log").read_text(encoding="utf-8").splitlines()]
+
+
 @pytest.mark.skipif(not POSIX, reason="用 sh 腳本模擬長時間工具")
-def test_timeout_warns_kills_process_tree_and_is_logged(project):
+def test_timeout_blocks_by_default(project):
+    # 逾時 = 沒驗完。預設必須擋,不可以當成通過(2026-11-03 使用者審查後改為預設 block)。
+    write(project, ".claude/verify.sh", "sleep 30\n")
+    configure(project, validators={"override": {"timeout": 1}})
+    r = run_hook(project)
+    assert r.elapsed < 15, r
+    assert r.blocked
+    assert "逾時,結果未判定(逾時不算通過)" in r.reason
+    assert "validators.override.timeout" in r.reason       # 告訴人可以調哪個值
+    assert "不算通過" in r.reason
+
+
+@pytest.mark.skipif(not POSIX, reason="用 sh 腳本模擬長時間工具")
+def test_timeout_warns_only_when_explicitly_configured_kills_tree_and_is_logged(project):
     pidfile = project / "bg.pid"
     write(project, ".claude/verify.sh",
           f'sleep 60 &\necho $! > "{pidfile}"\necho started\nsleep 60\n')
-    configure(project, validators={"override": {"timeout": 1}})
+    configure(project, on_timeout="warn", validators={"override": {"timeout": 1}})
     r = run_hook(project)
     assert r.elapsed < 15, r
     assert not r.blocked
@@ -77,8 +94,14 @@ def test_timeout_warns_kills_process_tree_and_is_logged(project):
     bg = int(pidfile.read_text())
     time.sleep(0.2)
     assert not alive(bg)  # 背景孫程序也被收掉了
-    log = [json.loads(x) for x in (project / ".claude/.verify.log").read_text(encoding="utf-8").splitlines()]
-    assert log[-1]["suspect"] == ["override"]
+    rec = read_log(project)[-1]
+    assert rec["suspect"] == ["override"]
+    res = rec["results"][0]
+    # 記錄逾時工具、執行時間、上限、成因、處置
+    assert res["id"] == "override" and res["status"] == "timeout"
+    assert res["cmd"].startswith("sh ") and res["cmd"].endswith("verify.sh")
+    assert 0.9 <= res["sec"] < 10 and res["limit"] == 1.0
+    assert res["cause"] == "validator_timeout" and res["action"] == "killed_process_tree"
 
 
 @pytest.mark.skipif(not POSIX, reason="用 sh 腳本模擬長時間工具")
@@ -95,7 +118,31 @@ def test_global_budget_bounds_total_time(project):
     configure(project, budget_seconds=5)
     r = run_hook(project)
     assert r.elapsed < 12, r
-    assert not r.blocked and "逾時" in r.system
+    assert r.blocked and "逾時" in r.reason
+    res = read_log(project)[-1]["results"][0]
+    assert res["cause"] == "budget_limited"   # 是整體預算不夠,不是驗證器自己的上限
+
+
+@pytest.mark.skipif(not POSIX, reason="用 sh 腳本模擬長時間工具")
+def test_timeout_is_never_recorded_as_success(project):
+    write(project, ".claude/verify.sh", "sleep 30\n")
+    configure(project, on_timeout="warn", validators={"override": {"timeout": 1}})
+    r1 = run_hook(project)
+    assert not r1.blocked
+    state = json.loads((project / ".claude/.verify_state.json").read_text(encoding="utf-8"))
+    assert "ok_fp" not in state                     # 沒有寫入「上次全綠」
+    rec = read_log(project)[-1]
+    assert [x["status"] for x in rec["results"]] == ["timeout"]
+    r2 = run_hook(project)                          # 沒有任何變更也必須重跑,不可走快速路徑
+    assert len(read_log(project)) == 2 and r2.elapsed >= 0.9
+
+
+@pytest.mark.skipif(not POSIX, reason="需要 POSIX 訊號")
+def test_process_killed_by_signal_is_a_failure_not_a_pass(project):
+    write(project, ".claude/verify.sh", "echo 'segfault-ish'\nkill -9 $$\n")
+    r = run_hook(project)
+    assert r.blocked
+    assert "被訊號 9 終止" in r.reason
 
 
 def test_real_failure_is_not_confused_with_missing_or_timeout(project):

@@ -4,6 +4,7 @@
 """
 
 import io
+import os
 import json
 import sys
 
@@ -70,7 +71,8 @@ def test_loop_guard_allows_when_nothing_changed_since_block(project):
     assert first.blocked
     second = stop(project, True)
     assert not second.blocked
-    assert "沒有新修改" in second.system
+    assert "沒有變更" in second.system and "這不是通過" in second.system
+    assert "json:fail" in second.system  # 說得出上次是什麼沒過
 
 
 def test_loop_guard_reblocks_when_files_changed_but_still_broken(project):
@@ -91,10 +93,11 @@ def test_loop_guard_allows_after_fix(project):
 
 
 def test_loop_guard_detects_deleted_file_as_a_change(project):
+    old = write(project, "other.json", BROKEN)
+    os.utime(old, (1_000_000_000, 1_000_000_000))  # 刪「較舊」的檔:只比 mtime 的舊語意看不到
     write(project, "data.json", BROKEN)
-    write(project, "other.json", BROKEN)
     assert stop(project, False).blocked
-    (project / "other.json").unlink()
+    old.unlink()
     r = stop(project, True)
     assert r.blocked  # data.json 仍壞,而且刪檔被視為「有修改」→ 重驗
 
@@ -132,7 +135,7 @@ def test_loop_guard_survives_windows_console_encoding(project):
     payload["stop_hook_active"] = True
     r = run_hook(project, payload, env=env)
     assert not r.blocked
-    assert "沒有新修改" in r.system
+    assert "沒有變更" in r.system
 
 
 def test_garbage_stdin_does_not_crash(project):

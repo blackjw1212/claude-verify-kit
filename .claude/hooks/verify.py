@@ -17,7 +17,8 @@ AdGuard、xlsx、shell、Python、Node、Rust)。
 每個結果是四種狀態之一,處置不同(.claude/verify.json 可調):
   fail     真正的驗證失敗           → 擋下
   missing  工具不存在               → 預設只警告(on_missing: warn|block|ignore)
-  timeout  逾時,記錄為疑點         → 預設只警告(on_timeout: warn|block|ignore)
+  timeout  逾時,記錄為疑點         → 預設擋下(on_timeout: block|warn|ignore)
+                                     逾時 = 沒驗完,絕不算通過;要放寬必須明確設定
   error    執行錯誤 / hook 內部錯誤 → 只警告(fail-open,但使用者看得到)
 
 協定依據 https://code.claude.com/docs/en/hooks (2026-11 查核):
@@ -71,10 +72,18 @@ SKIP_DIRS = {".git", "build", ".pio", "node_modules", ".claude", ".vscode",
 
 # 這些檔名「規格上就允許註解/尾逗號」(JSONC)。嚴格 JSON 解析失敗時,
 # 只有它們會再用 JSONC 規則重試;一般 .json 有註解仍然算壞掉。
+# 每一項都有出處(2026-11-03 查核),沒有出處的不收 —— 放寬錯了就是漏擋:
+#   tsconfig/jsconfig  tsc 6.0.2 實測:--init 產生的檔案自帶註解,含註解+尾逗號的 -p 可編譯
+#   devcontainer       devcontainers/spec:「JSON with Comments file called devcontainer.json」
+#   .eslintrc.json     ESLint v8 文件:「ESLint's JSON files also allow JavaScript-style comments」
+#   .babelrc.json      Babel 文件:以 JSON5 解析(本檢查只處理註解與尾逗號,不是完整 JSON5)
+#   api-extractor.json 官方範本(rushstack)本身含註解
+#   tslint.json        palantir/tslint 讀檔時先 stripComments
+# 刻意不收:deno.json、turbo.json(官方文件都說要註解請改用 .jsonc);
+#           biome.json(查不到官方說法)。
 JSONC_NAMES = ("tsconfig*.json", "jsconfig*.json", "devcontainer.json",
                ".devcontainer.json", ".eslintrc.json", ".babelrc.json",
-               "api-extractor.json", "tslint.json", "deno.json", "turbo.json",
-               "biome.json")
+               "api-extractor.json", "tslint.json")
 
 CONFIG_NAME = "verify.json"
 STATE_NAME = ".verify_state.json"
@@ -89,7 +98,7 @@ DEFAULT_CONFIG = {
     "rerun_when_active": True,      # False = 舊行為:stop_hook_active 一律放行
     "max_consecutive_blocks": 5,    # 同一輪連續擋幾次後放行;0 = 只靠 Claude Code 的上限
     "on_missing": "warn",           # warn | block | ignore
-    "on_timeout": "warn",           # warn | block | ignore
+    "on_timeout": "block",          # block | warn | ignore — 逾時不算通過,預設擋
     "validators": {},               # {"<id>": {"timeout": 秒, "on_missing": ..., "on_timeout": ...}}
 }
 
@@ -461,16 +470,40 @@ def summarize(text, max_lines, project=None):
 # ---------------------------------------------------------------- 結果與執行環境
 
 class Result:
-    __slots__ = ("vid", "label", "status", "lines", "rc", "duration")
+    __slots__ = ("vid", "label", "status", "lines", "rc", "duration", "meta")
 
-    def __init__(self, vid, label, status, lines=None, rc=None, duration=0.0):
+    def __init__(self, vid, label, status, lines=None, rc=None, duration=0.0, meta=None):
         self.vid, self.label, self.status = vid, label, status
         self.lines = lines or []
         self.rc, self.duration = rc, duration
+        self.meta = meta or {}
 
     def as_log(self):
-        return {"id": self.vid, "status": self.status, "rc": self.rc,
-                "sec": round(self.duration, 2)}
+        rec = {"id": self.vid, "status": self.status, "rc": self.rc,
+               "sec": round(self.duration, 2)}
+        rec.update(self.meta)
+        return rec
+
+
+# 逾時的成因與處置,寫進 .verify.log 與訊息,讓人分得出「工具卡住」還是「預算不夠」。
+TIMEOUT_CAUSES = {
+    "validator_timeout": "超過此驗證器的上限",
+    "budget_limited": "超過整體時間預算剩下的時間",
+    "budget_exhausted": "整體時間預算已用盡,沒有執行",
+}
+
+
+def timeout_result(vid, label, limit, dur, cause, cmd=""):
+    started = cause != "budget_exhausted"
+    action = "killed_process_tree" if started else "not_started"
+    line = (f"執行 {dur:.0f}s 後逾時(上限 {limit:.0f}s,{TIMEOUT_CAUSES[cause]}),已終止整個程序樹"
+            if started else TIMEOUT_CAUSES[cause])
+    return Result(vid, label, "timeout", [line + ";結果未判定,不算通過"], duration=dur,
+                  meta={"cmd": cmd, "limit": round(limit, 1), "cause": cause, "action": action})
+
+
+def _display_cmd(argv):
+    return " ".join("<inline script>" if "\n" in str(a) else str(a) for a in argv)[:300]
 
 
 class Ctx:
@@ -508,11 +541,17 @@ class Ctx:
             return str(path)
 
     # ---- 執行外部工具並轉成 Result
+    def budget_cause(self, vid, limit):
+        if limit <= 0:
+            return "budget_exhausted"
+        return "budget_limited" if limit < float(vopt(self.cfg, vid, "timeout")) else "validator_timeout"
+
     def tool(self, vid, label, argv, cwd=None, env=None, stdin_bytes=None,
              fail_detect=None):
         timeout = self.timeout_for(vid)
         status, rc, text, dur = run_tool(argv, str(cwd or self.project), timeout,
                                          env=env, stdin_bytes=stdin_bytes)
+        # fail_detect 只能在「跑完了」的兩種結果之間改判;逾時/缺工具/錯誤不可能被改成通過。
         if status in ("ok", "fail") and fail_detect is not None:
             status = "fail" if fail_detect(rc, text) else "ok"
         max_lines = self.cfg["max_lines"]
@@ -523,9 +562,16 @@ class Ctx:
         if status == "missing":
             return Result(vid, label, "missing", [f"{text}(不在 PATH)"], duration=dur)
         if status == "timeout":
-            return Result(vid, label, "timeout",
-                          [f"逾時(上限 {timeout:.0f}s),結果未判定"], duration=dur)
+            return timeout_result(vid, label, timeout, dur, self.budget_cause(vid, timeout),
+                                  _display_cmd(argv))
         return Result(vid, label, "error", [clip(text, 220)], duration=dur)
+
+    def budget_stop(self, vid, label, t0):
+        """程序內的檢查(JSON/XML/xlsx)在檔案之間發現預算用盡。"""
+        r = timeout_result(vid, label, 0.0, time.monotonic() - t0, "budget_exhausted")
+        r.lines = ["整體時間預算用盡,其餘檔案沒有檢查;結果未判定,不算通過"]
+        r.meta["action"] = "stopped_mid_scan"
+        return r
 
 
 def walk_files(project):
@@ -602,29 +648,38 @@ def check_firmware(ctx):
 
 
 def _per_file(ctx, vid, label, files, argv_for, cwd_for=None):
-    """同一個工具逐檔執行,聚合成一個 Result。"""
+    """同一個工具逐檔執行,聚合結果。
+
+    中途遇到缺工具/逾時/錯誤就停,但**已找到的失敗要保留**(舊版會整個丟掉,
+    只回報逾時,模型看不到其實已經確定壞掉的檔案)。回傳 list[Result]。
+    """
     fails, worst, total = [], None, 0.0
+    stop = None
     for f in files:
         r = ctx.tool(vid, label, argv_for(f), cwd=cwd_for(f) if cwd_for else None)
         total += r.duration
         if r.status in ("missing", "timeout", "error"):
-            r.duration = total
-            return r
+            stop = r
+            break
         if r.status == "fail":
             fails.append(f"{ctx.rel(f)}:")
             fails.extend("  " + ln for ln in r.lines)
             worst = r.rc
+    out = []
     if fails:
-        return Result(vid, label, "fail", fails, worst, total)
-    return Result(vid, label, "pass", duration=total)
+        out.append(Result(vid, label, "fail", fails, worst, total))
+    if stop is not None:
+        stop.duration = total
+        out.append(stop)
+    return out or [Result(vid, label, "pass", duration=total)]
 
 
 def check_plist(ctx):
     files = ctx.glob("*.plist")
     if not files:
         return []
-    out = [_per_file(ctx, "plist", "plist 語法(plutil)", files,
-                     lambda f: ["plutil", "-lint", str(f)])]
+    out = _per_file(ctx, "plist", "plist 語法(plutil)", files,
+                    lambda f: ["plutil", "-lint", str(f)])
     oc = next((p for p in files if p.name == "config.plist"), None)
     if oc is not None:
         r = ctx.tool("opencore", "OpenCore 語意(ocvalidate)", ["ocvalidate", str(oc)])
@@ -638,17 +693,21 @@ def check_acpi(ctx):
     files = ctx.glob("*.dsl")
     if not files:
         return []
-    return [_per_file(ctx, "acpi", "ACPI/SSDT(iasl)", files,
-                      lambda f: ["iasl", str(f)], cwd_for=lambda f: f.parent)]
+    return _per_file(ctx, "acpi", "ACPI/SSDT(iasl)", files,
+                     lambda f: ["iasl", str(f)], cwd_for=lambda f: f.parent)
 
 
-def _collect(vid, label, fails, ctx, t0):
+def _collect(vid, label, fails, ctx, t0, stopped=False):
+    """程序內檢查的結果。stopped=True:預算中途用盡 → 已找到的失敗 + 一筆 timeout。"""
     dur = time.monotonic() - t0
-    if not fails:
-        return Result(vid, label, "pass", duration=dur)
-    n = ctx.cfg["max_lines"]
-    lines = fails[:n] + ([f"…另 {len(fails) - n} 個檔案省略"] if len(fails) > n else [])
-    return Result(vid, label, "fail", lines, duration=dur)
+    out = []
+    if fails:
+        n = ctx.cfg["max_lines"]
+        lines = fails[:n] + ([f"…另 {len(fails) - n} 個檔案省略"] if len(fails) > n else [])
+        out.append(Result(vid, label, "fail", lines, duration=dur))
+    if stopped:
+        out.append(ctx.budget_stop(vid, label, t0))
+    return out or [Result(vid, label, "pass", duration=dur)]
 
 
 def check_xml(ctx):
@@ -659,8 +718,7 @@ def check_xml(ctx):
     fails = []
     for f in files:
         if ctx.remaining() < 3:
-            return [Result("xml", "XML 格式", "timeout", ["時間預算用盡,未檢查完"],
-                           duration=time.monotonic() - t0)]
+            return _collect("xml", "XML 格式", fails, ctx, t0, stopped=True)
         parser = xml.parsers.expat.ParserCreate()
         try:
             with open(f, "rb") as fh:
@@ -669,7 +727,7 @@ def check_xml(ctx):
             fails.append(f"{ctx.rel(f)}:{e.lineno}:{e.offset}: {xml.parsers.expat.ErrorString(e.code)}")
         except OSError as e:
             fails.append(f"{ctx.rel(f)}: 無法讀取({e})")
-    return [_collect("xml", "XML 格式", fails, ctx, t0)]
+    return _collect("xml", "XML 格式", fails, ctx, t0)
 
 
 def strip_jsonc(text):
@@ -714,8 +772,7 @@ def check_json(ctx):
     fails = []
     for f in files:
         if ctx.remaining() < 3:
-            return [Result("json", "JSON 格式", "timeout", ["時間預算用盡,未檢查完"],
-                           duration=time.monotonic() - t0)]
+            return _collect("json", "JSON 格式", fails, ctx, t0, stopped=True)
         try:
             # utf-8-sig 容忍 UTF-8 BOM(Windows 編輯器常見)。
             text = f.read_text(encoding="utf-8-sig")
@@ -734,7 +791,7 @@ def check_json(ctx):
             except json.JSONDecodeError as e2:
                 err = e2
         fails.append(f"{ctx.rel(f)}:{err.lineno}:{err.colno}: {err.msg}")
-    return [_collect("json", "JSON 格式", fails, ctx, t0)]
+    return _collect("json", "JSON 格式", fails, ctx, t0)
 
 
 def check_adblock(ctx):
@@ -762,13 +819,12 @@ def check_xlsx(ctx):
     fails = []
     for f in files:
         if ctx.remaining() < 3:
-            return [Result("xlsx", "Excel xlsx", "timeout", ["時間預算用盡,未檢查完"],
-                           duration=time.monotonic() - t0)]
+            return _collect("xlsx", "Excel xlsx", fails, ctx, t0, stopped=True)
         try:
             openpyxl.load_workbook(str(f))
         except Exception as e:
             fails.append(f"{ctx.rel(f)}: 損毀/無法載入({clip(str(e), 160)})")
-    return [_collect("xlsx", "Excel xlsx", fails, ctx, t0)]
+    return _collect("xlsx", "Excel xlsx", fails, ctx, t0)
 
 
 def check_shell(ctx):
@@ -830,8 +886,18 @@ def check_python(ctx):
         return out
     # 用「該直譯器能不能 import pytest」當判準,而不是 PATH 上有沒有 pytest ——
     # venv 沒裝 pytest 時硬跑會回非 0,變成另一種假擋。
-    st, _, _, _ = run_tool([py, "-c", "import pytest"], str(ctx.project), min(30.0, ctx.remaining()))
-    if st != "ok":
+    # 探測本身的結果要分清楚:只有「跑完且 import 失敗」才是缺 pytest。
+    # 探測逾時 / 跑不起來若也當成「缺工具」,在 on_missing=warn 下等於整組測試沒跑就放行。
+    limit = max(0.0, min(30.0, ctx.remaining() - 3.0))
+    st, _, text, dur = run_tool([py, "-c", "import pytest"], str(ctx.project), limit)
+    if st == "timeout":
+        out.append(timeout_result("pytest", "pytest", limit, dur, ctx.budget_cause("pytest", limit),
+                                  _display_cmd([py, "-c", "import pytest"])))
+        return out
+    if st == "error":
+        out.append(Result("pytest", "pytest", "error", [clip(text, 220)], duration=dur))
+        return out
+    if st != "ok":  # fail(ImportError)或 missing(直譯器本身不見了)
         out.append(Result("pytest", "pytest", "missing", [f"{py} 沒有 pytest(pip install pytest)"]))
         return out
 
@@ -946,20 +1012,38 @@ def policy_of(cfg, r):
 KIND = {"missing": "工具缺失", "timeout": "逾時,疑點", "error": "執行錯誤", "fail": "失敗"}
 
 
+def fmt_rc(rc):
+    """被訊號終止(POSIX 負值)或 Windows NTSTATUS(如 0xC0000005)要讀得出來。"""
+    if rc is None:
+        return ""
+    if rc < 0:
+        return f"被訊號 {-rc} 終止"
+    if rc > 255:
+        return f"exit 0x{rc & 0xFFFFFFFF:08X}"
+    return f"exit {rc}"
+
+
 def build_reason(blocking, warnings, cfg):
     limit = cfg["max_reason_chars"]
     parts = [f"驗證未通過({len(blocking)} 項)。請修正後再結束,不要宣稱任務已完成。"]
     for i, r in enumerate(blocking):
         head = f"✗ [{r.vid}] {r.label}"
-        if r.status != "fail":
+        if r.status == "timeout":
+            head += ":逾時,結果未判定(逾時不算通過)"
+        elif r.status != "fail":
             head += f":{KIND[r.status]}(設定要求視為失敗)"
         elif r.rc not in (None, 0):
-            head += f"(exit {r.rc})"
+            head += f"({fmt_rc(r.rc)})"
         block = "\n".join([head] + ["  " + ln for ln in r.lines])
         if sum(len(p) for p in parts) + len(block) > limit - 300:
             parts.append(f"…另 {len(blocking) - i} 項省略(輸出太長)")
             break
         parts.append(block)
+    timed_out = [r.vid for r in blocking if r.status == "timeout"]
+    if timed_out:
+        parts.append("逾時不代表失敗,也不代表通過。若是卡住(等待輸入、死迴圈、測試掛住)請修正;"
+                     "若是正常的長時間建置,請使用者決定是否調高 .claude/verify.json 的 "
+                     + "、".join(f"validators.{v}.timeout" for v in dict.fromkeys(timed_out)) + "。")
     if warnings:
         parts.append("⚠ 未驗證(不擋):" + ";".join(f"{r.label}({KIND[r.status]})" for r in warnings))
     parts.append("(硬體專屬或 WIP 改動需要略過時,請使用者決定是否 touch .claude/skip-verify;不要自行建立。)")
@@ -1044,17 +1128,22 @@ def main():
     if active:
         if not cfg["rerun_when_active"]:
             finish(cfg)  # 舊行為:已在續跑中 → 一律放行
+        last = "、".join(state.get("last_block") or []) or "未知"
         if state.get("block_fp") == fp_before:
             save_state(project, state)
-            append_log(project, {"decision": "allow-unchanged", "active": True})
+            append_log(project, {"decision": "allow-unchanged", "active": True,
+                                 "last_block": state.get("last_block")})
             finish(cfg, system=warning_message([], notes + [
-                "上次擋下後專案沒有新修改,放行以免卡死;驗證仍未通過,請自行確認。"]))
+                "上次擋下後專案檔案沒有變更,本次不重驗、直接放行以免卡死。"
+                f"上次未通過:{last}(這不是通過,請自行確認)。"]))
         cap = cfg["max_consecutive_blocks"]
         if cap and state.get("blocks", 0) >= cap:
             save_state(project, state)
-            append_log(project, {"decision": "allow-cap", "active": True, "blocks": state["blocks"]})
+            append_log(project, {"decision": "allow-cap", "active": True, "blocks": state["blocks"],
+                                 "last_block": state.get("last_block")})
             finish(cfg, system=warning_message([], notes + [
-                f"已連續擋下 {cap} 次仍未通過,放行交還給你;紀錄在 .claude/{LOG_NAME}。"]))
+                f"已連續擋下 {cap} 次仍未通過,放行交還給你。上次未通過:{last}(這不是通過);"
+                f"紀錄在 .claude/{LOG_NAME}。"]))
 
     override = find_override(project)
     if override is None and state.get("ok_fp") == fp_before:
@@ -1093,6 +1182,7 @@ def main():
     if blocking:
         state["blocks"] = state.get("blocks", 0) + 1
         state["block_fp"] = fp_after
+        state["last_block"] = [f"{r.vid}:{r.status}" for r in blocking]
         state.pop("ok_fp", None)
         save_state(project, state)
         finish(cfg, "block", build_reason(blocking, warnings, cfg),
@@ -1100,6 +1190,7 @@ def main():
 
     state["blocks"] = 0
     state.pop("block_fp", None)
+    state.pop("last_block", None)
     if any(r.status in ("timeout", "error") for r in results):
         state.pop("ok_fp", None)  # 沒驗完不算綠,下次重驗
     elif override is None:
