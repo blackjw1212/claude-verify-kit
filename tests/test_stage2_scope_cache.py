@@ -15,44 +15,7 @@ import pytest
 from conftest import configure, run_hook, write
 
 POSIX = os.name != "nt"
-pytestmark = pytest.mark.skipif(not POSIX, reason="假工具是 sh 腳本")
-
-
-@pytest.fixture
-def fake(tmp_path):
-    """建立假工具。回傳 (env, calls())。"""
-    bindir = tmp_path / "fakebin"
-    bindir.mkdir()
-    log = tmp_path / "calls.log"
-    log.write_text("", encoding="utf-8")
-
-    def make(name, sleep=0.0, rc=0, output=""):
-        script = bindir / name
-        script.write_text(
-            "#!/bin/sh\n"
-            f'echo "{name} start $(date +%s.%N)" >> "{log}"\n'
-            f"sleep {sleep}\n"
-            + (f"cat <<'EOF'\n{output}\nEOF\n" if output else "")
-            + f'echo "{name} end $(date +%s.%N)" >> "{log}"\n'
-            f"exit {rc}\n", encoding="utf-8")
-        script.chmod(0o755)
-        return script
-
-    def calls(name=None):
-        rows = [ln.split() for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        out = {}
-        for tool, kind, ts in rows:
-            out.setdefault(tool, []).append((kind, float(ts)))
-        if name is None:
-            return out
-        return out.get(name, [])
-
-    def runs(name):
-        return sum(1 for k, _ in calls(name) if k == "start")
-
-    env = {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "CLAUDE_VERIFY_DEBUG": "1"}
-    return type("Fake", (), {"make": staticmethod(make), "calls": staticmethod(calls),
-                             "runs": staticmethod(runs), "env": env, "bindir": bindir})
+# 假工具(fake fixture)在 conftest:Python 實作、依平台產生 sh / .cmd 啟動器,所以這些測試在 Windows 也會跑。
 
 
 def last_log(project):
@@ -163,9 +126,7 @@ def test_tool_upgrade_invalidates_per_file_cache(project, fake):
     write(project, "b.json", "{}")                         # 只改 JSON:shell 不該重跑
     run_hook(project, env=fake.env)
     assert fake.runs("shellcheck") == 1
-    fake.make("shellcheck", output="")                      # 「升級」:同名但內容不同
-    (fake.bindir / "shellcheck").write_text(
-        (fake.bindir / "shellcheck").read_text(encoding="utf-8") + "# v2\n", encoding="utf-8")
+    fake.bump(fake.launcher("shellcheck"))                   # 「升級」:同名但內容不同
     write(project, "b.json", '{"v": 2}')
     run_hook(project, env=fake.env)
     assert fake.runs("shellcheck") == 2
@@ -342,7 +303,8 @@ def test_failing_tests_rerun_even_without_changes(project, fake, tmp_path):
 
 def test_override_cached_when_unchanged_and_rerun_on_change(project, fake, tmp_path):
     counter = tmp_path / "counter"
-    write(project, ".claude/verify.sh", f'printf x >> "{counter}"\n')
+    # Stage 3-1:改用 Python 自訂驗證,Windows 上也能跑(原本是 sh)
+    write(project, ".claude/verify.py", f"open({str(counter)!r}, 'a').write('x')\n")
     configure(project, override_cache=True)   # 深度驗收後預設改為 false(自訂腳本的相依無從得知)
     write(project, "a.txt", "1")
     run_hook(project, env=fake.env)
@@ -355,7 +317,7 @@ def test_override_cached_when_unchanged_and_rerun_on_change(project, fake, tmp_p
 
 def test_override_cache_false_runs_every_time(project, fake, tmp_path):
     counter = tmp_path / "counter"
-    write(project, ".claude/verify.sh", f'printf x >> "{counter}"\n')
+    write(project, ".claude/verify.py", f"open({str(counter)!r}, 'a').write('x')\n")
     configure(project, override_cache=False)
     for _ in range(3):
         run_hook(project, env=fake.env)

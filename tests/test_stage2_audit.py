@@ -1,6 +1,7 @@
 """Stage 2 深度驗收(2026-11-03):快取會不會在「程式或環境已經改變」時沿用舊的通過結果。
 
-每一條都是「改了某樣東西 → 必須重新驗證(或必須擋下)」。外部工具一樣用假工具(sh 腳本),
+每一條都是「改了某樣東西 → 必須重新驗證(或必須擋下)」。外部工具一樣用假工具(Stage 3-1 起是
+Python 實作 + 依平台產生的 sh / .cmd 啟動器),
 所以這裡驗的是「hook 有沒有察覺變化並重跑」,不是那些工具本身;標「模擬」的情境見報告。
 """
 
@@ -16,12 +17,12 @@ from pathlib import Path
 
 import pytest
 
-from conftest import HOOK, configure, run_hook, write
-from test_stage2_scope_cache import (fake, idf_project, last_log, pio_project,  # noqa: F401
-                                     plan_of)
+from conftest import HOOK, POSIX, configure, run_hook, venv_python, write
+from test_stage2_scope_cache import idf_project, last_log, pio_project, plan_of
 
-POSIX = os.name != "nt"
-pytestmark = pytest.mark.skipif(not POSIX, reason="假工具是 sh 腳本")
+# 假工具(fake fixture)在 conftest,跨平台。真正依賴 POSIX 的測試逐條標明原因。
+def posix_only(why):
+    return pytest.mark.skipif(not POSIX, reason=f"POSIX 專屬:{why}")
 BAD = '{"a": }'
 
 
@@ -50,6 +51,7 @@ def ok_tests(project):
 
 # ================================================================ 1. 環境改變 → 相關驗證重跑
 
+@posix_only("用 symlink 換掉 .venv 的直譯器;Windows 建 symlink 需要開發者模式或系統管理員權限")
 def test_python_interpreter_switch_reverifies(project, fake):
     others = [p for p in (shutil.which("python3.11"), shutil.which("python3.12"), shutil.which("python3"))
               if p and os.path.realpath(p) != os.path.realpath(sys.executable)]
@@ -70,7 +72,10 @@ def test_global_python_package_install_reverifies(project, fake, tmp_path):
     env = dict(fake.env, PYTHONUSERBASE=str(tmp_path / "userbase"))
     ok_tests(project)
     green_twice(project, env)
-    site_dir = tmp_path / "userbase" / "lib" / f"python{sys.version_info[0]}.{sys.version_info[1]}" / "site-packages"
+    # 使用者 site 的路徑各平台不同(POSIX lib/pythonX.Y/site-packages、Windows PythonXY\\site-packages),問直譯器本身
+    site_dir = Path(subprocess.run([sys.executable, "-c", "import site; print(site.getusersitepackages())"],
+                                   env=dict(os.environ, **env), capture_output=True, text=True).stdout.strip())
+    assert str(site_dir).startswith(str(tmp_path / "userbase")), site_dir
     write(site_dir, "newpkg/__init__.py", "X = 1\n")   # 等同 pip install --user newpkg
     run_hook(project, env=env)
     # 直譯器在 venv 裡(或用 -s)時根本不讀使用者 site:那裡的變化對它不可見,不重驗才是對的。
@@ -86,7 +91,7 @@ def _venv(project):
     # 用真的 venv(有 pyvenv.cfg):第一版測試只放了一個 symlink,Python 根本不會把它當 venv,
     # 套件目錄也就不在直譯器的搜尋路徑裡 —— 那是測試夾具的錯,不是 hook 的。
     subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(project / ".venv")], check=True)
-    out = subprocess.run([str(project / ".venv" / "bin" / "python"), "-c",
+    out = subprocess.run([str(venv_python(project / ".venv")), "-c",
                           "import site; print(site.getsitepackages()[0])"],
                          check=True, capture_output=True, text=True).stdout.strip()
     sp = Path(out)
@@ -147,9 +152,7 @@ def test_node_version_switch_reverifies(project, fake):
     node_project(project)
     green_twice(project, fake.env)
     real = shutil.which("node")
-    shim = fake.bindir / "node"                # 模擬 nvm 切換:PATH 上的 node 換成另一個
-    shim.write_text(f'#!/bin/sh\nexec "{real}" "$@"\n', encoding="utf-8")
-    shim.chmod(0o755)
+    fake.wrap("node", real)                    # 模擬 nvm 切換:PATH 上的 node 換成另一個
     run_hook(project, env=fake.env)
     assert reverified(project, "node")
 
@@ -184,7 +187,7 @@ def test_esp_idf_compiler_update_rebuilds(project, fake):
     cc = fake.make("xtensa-esp32-elf-gcc")
     idf_project(project)
     green_twice(project, fake.env)
-    cc.write_text(cc.read_text(encoding="utf-8") + "# gcc 14\n", encoding="utf-8")
+    fake.bump(cc)
     run_hook(project, env=fake.env)
     assert fake.runs("idf.py") == 2
 
@@ -209,7 +212,7 @@ def test_linter_upgrade_without_file_changes_reverifies(project, fake):
     sc = fake.make("shellcheck")
     write(project, "a.sh", "#!/bin/sh\necho ok\n")
     green_twice(project, fake.env)
-    sc.write_text(sc.read_text(encoding="utf-8") + "# 0.12\n", encoding="utf-8")
+    fake.bump(sc)
     run_hook(project, env=fake.env)
     assert reverified(project, "shell") and fake.runs("shellcheck") == 2
 
@@ -439,6 +442,7 @@ def _alive(pid):
     return True
 
 
+@posix_only("SIGKILL hook 本身 + /proc 檢查殭屍;Windows 的強制終止見 test_crossplatform")
 def test_killed_mid_run_leaves_no_cache_that_passes_a_broken_file(project, fake, tmp_path):
     _slow_pio(fake, tmp_path / "pio.pid")
     pio_project(project)
@@ -456,6 +460,7 @@ def test_killed_mid_run_leaves_no_cache_that_passes_a_broken_file(project, fake,
     assert r.blocked and "a.json" in r.reason
 
 
+@posix_only("SIGTERM 是 POSIX 訊號;Windows 對應的是 CTRL_BREAK / TerminateProcess,見 test_crossplatform")
 def test_sigterm_stops_child_processes(project, fake, tmp_path):
     pidfile = tmp_path / "pio.pid"
     _slow_pio(fake, pidfile)
@@ -597,7 +602,12 @@ def test_installing_a_missing_tool_counts_as_a_change_for_the_loop_guard(project
     # Stage 1 遺留疑點:Claude 只是補裝工具、沒改專案檔 → 舊版防迴圈當成「沒變」直接放行。
     write(project, "a.sh", "#!/bin/sh\necho ok\n")
     configure(project, on_missing="block")
-    env = dict(fake.env, PATH=f"{fake.bindir}{os.pathsep}/usr/bin{os.pathsep}/bin")  # 確定沒有真的 shellcheck
+    dirs = [str(fake.bindir), os.path.dirname(sys.executable)]
+    if not POSIX:
+        dirs.append(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"))
+    else:
+        dirs += ["/usr/bin", "/bin"]
+    env = dict(fake.env, PATH=os.pathsep.join(dirs))  # 確定沒有真的 shellcheck
     assert shutil.which("shellcheck", path=env["PATH"]) is None
     first = run_hook(project, {"session_id": "s1", "stop_hook_active": False}, env=env)
     assert first.blocked and "工具缺失" in first.reason
@@ -629,6 +639,6 @@ def test_host_compiler_upgrade_rebuilds(project, fake):
     gcc = fake.make("gcc")
     pio_project(project)
     green_twice(project, fake.env)
-    gcc.write_text(gcc.read_text(encoding="utf-8") + "# gcc 14\n", encoding="utf-8")
+    fake.bump(gcc)
     run_hook(project, env=fake.env)
     assert fake.runs("pio") == 2

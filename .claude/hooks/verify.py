@@ -899,14 +899,37 @@ def save_cache(project, manifest, results, ok_fp=None, chash=None):
                "manifest": manifest.entries, "results": results, "ok_fp": ok_fp}
     data = dict(payload)
     data["checksum"] = _checksum(payload)
-    path = project / ".claude" / CACHE_NAME
+    atomic_write(project / ".claude" / CACHE_NAME,
+                 json.dumps(data, ensure_ascii=False, separators=(",", ":")), "快取")
+
+
+# Windows:目標檔正被別的程序開著(另一個 hook 正在讀、防毒或索引服務在掃)時,os.replace 會回
+# PermissionError(WinError 5/32)。那通常只持續幾十毫秒,所以短暫重試;POSIX 上幾乎不會走到。
+REPLACE_RETRIES = 6
+
+
+def atomic_write(path, text, what):
+    """寫暫存檔再原子替換:讀的人只會看到舊的或新的完整檔案。
+    失敗時刪掉自己的暫存檔並回 False —— 寫不進去只代表下次要重驗,不會留下半份檔案。"""
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        os.replace(str(tmp), str(path))   # 原子替換:讀的人只會看到舊的或新的完整檔案
+        tmp.write_text(text, encoding="utf-8")
+        for attempt in range(REPLACE_RETRIES):
+            try:
+                os.replace(str(tmp), str(path))
+                return True
+            except PermissionError:
+                if attempt == REPLACE_RETRIES - 1:
+                    raise
+                time.sleep(0.03 * (attempt + 1))
     except OSError as e:
-        warn(f"無法寫入快取:{e}")
+        warn(f"無法寫入{what}:{e}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return False
 
 
 def cleanup_stale_tmp(project, age=600):
@@ -2199,14 +2222,7 @@ def load_state(project):
 
 
 def save_state(project, state):
-    path = project / ".claude" / STATE_NAME
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-        os.replace(str(tmp), str(path))
-    except OSError as e:
-        warn(f"無法寫入狀態檔:{e}")
+    atomic_write(project / ".claude" / STATE_NAME, json.dumps(state, ensure_ascii=False), "狀態檔")
 
 
 def append_log(project, record):
