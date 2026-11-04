@@ -1,7 +1,15 @@
-# 跨平台測試:Ubuntu / Windows / macOS × Python 3.8 / 3.11 / 3.12 / 3.13。
+# 跨平台測試:Ubuntu / Windows / macOS × Python 3.8 / 3.11 / 3.12 / 3.13,外加一個在 Linux 上掛真的
+# 檔案系統(ext4、xfs、btrfs、tmpfs、overlay、ntfs-3g、fusefat、exfat-fuse)的 job。
+#
+# 綠燈的意思是「該跑的都跑了而且通過」,不只是「沒有測試失敗」。Stage 3.1 重現過三種假綠燈:
+# 工具沒裝 → 測試跳過 → pytest 照樣 exit 0;平台判斷壞掉 → Windows 專屬的測試在 Windows 上也跳過;
+# 少了幾格 → 摘要表上就少幾列。對應的防線:
+#   1. 必要工具在測試之前檢查,缺了就在那一步紅(安裝失敗與測試跳過分開)
+#   2. 每格的「假綠燈檢查」:跳過的原因必須是這個平台預期的(政策寫在 junit_summary.py 開頭)
+#   3. summary:12 格齊全、每格收集到的測試數相同、同一個作業系統的各 Python 版本跳過的測試相同,
+#      而且所有上游 job 都成功
+#   4. 摘要腳本自己讀不到或解析失敗 → 紅
 # fail-fast 關掉:一格紅了其他格照跑,才看得出是「某平台的問題」還是「全部都壞」。
-# 每格都上傳 JUnit XML,並把通過/失敗/跳過(含跳過原因)寫進該格的 job 摘要;最後的 summary job
-# 把 12 格合成一張表(artifact: cross-platform-summary)。跳過不等於通過,兩者分開計。
 name: tests
 
 on:
@@ -29,6 +37,17 @@ jobs:
       - run: python -m pip install vermin==1.6.0
       - run: vermin -t=3.8- --no-tips --violations --eval-annotations .claude/hooks/verify.py tests bench .github/scripts
 
+  workflow-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: python -m pip install actionlint-py==1.7.12.25
+      - run: actionlint -color
+
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
@@ -43,23 +62,63 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v5
+      # 多裝一個 Python:test_python_interpreter_switch_reverifies 要在同一個 venv 路徑後面換直譯器。
+      # 最後一行是這一格的版本(setup-python 以最後一個為預設)。
       - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python }}
+          python-version: |
+            ${{ matrix.python == '3.12' && '3.11' || '3.12' }}
+            ${{ matrix.python }}
+      - name: 安裝 shellcheck(Linux)
+        if: runner.os == 'Linux'
+        run: command -v shellcheck || (sudo apt-get update && sudo apt-get install -y shellcheck)
+      - name: 安裝 shellcheck(macOS)
+        if: runner.os == 'macOS'
+        run: command -v shellcheck || brew install shellcheck
+      - name: 安裝 shellcheck(Windows)
+        if: runner.os == 'Windows'
+        run: command -v shellcheck || choco install shellcheck -y --no-progress
+      - name: 必要工具檢查(缺了就在這裡紅,不讓它變成測試跳過)
+        run: |
+          missing=0
+          for t in shellcheck node npm; do
+            if command -v "$t" >/dev/null 2>&1; then echo "$t:$(command -v "$t")"
+            else echo "::error::必要工具缺少:$t"; missing=1; fi
+          done
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            # 與 test_python_interpreter_switch_reverifies 找第二個直譯器的方式相同
+            python -c "import os, shutil, sys; o = [p for p in (shutil.which('python3.11'), shutil.which('python3.12'), shutil.which('python3')) if p and os.path.realpath(p) != os.path.realpath(sys.executable)]; print('第二個 Python:', o[:1]); sys.exit(0 if o else 1)" \
+              || { echo "::error::找不到第二個 Python 直譯器"; missing=1; }
+          fi
+          exit $missing
       - name: 環境紀錄
         run: |
           python -VV
           python -c "import sys, locale; print(sys.platform, 'locale=' + locale.getpreferredencoding(False), 'fs=' + sys.getfilesystemencoding(), 'stdout=' + str(sys.stdout.encoding))"
-          node --version || echo "node: 未安裝"
-          shellcheck --version | head -2 || echo "shellcheck: 未安裝"
-      - run: python -m pip install pytest
+          node --version
+          npm --version
+          shellcheck --version | sed -n 2p
+      # 版本與選擇理由在 .github/ci-requirements.txt。版本要在安裝之後才印
+      # (步驟帶 -e,還沒裝 pytest 就印會讓 12 格全紅 —— Stage 3.1 的提案第一版犯過)
+      - name: 安裝 pytest
+        run: |
+          python -m pip install -r .github/ci-requirements.txt
+          python -m pytest --version
+      # --basetemp:不用 /tmp/pytest-of-<user>(CVE-2025-71176;3.8 那格的 pytest 8.3.5 沒有修正)
       - name: 測試
         run: >
-          python -m pytest tests -rs -p no:cacheprovider
+          python -m pytest tests -rsxX -p no:cacheprovider
+          --basetemp "$RUNNER_TEMP/pytest-tmp"
           --junitxml "junit-${{ matrix.os }}-py${{ matrix.python }}.xml"
-      - name: 結果摘要(通過 / 失敗 / 跳過與原因)
+      - name: 結果摘要(通過 / 失敗 / 跳過 / 已知限制與原因)
         if: always()
         run: python .github/scripts/junit_summary.py cell "junit-${{ matrix.os }}-py${{ matrix.python }}.xml" >> "$GITHUB_STEP_SUMMARY"
+      - name: 假綠燈檢查(跳過的原因必須是這個平台預期的)
+        if: always()
+        run: >
+          python .github/scripts/junit_summary.py check
+          "junit-${{ matrix.os }}-py${{ matrix.python }}.xml"
+          --os "$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -67,9 +126,52 @@ jobs:
           path: junit-*.xml
           if-no-files-found: error
 
+  fs-semantics:
+    # trust_mtime 的安全性取決於檔案系統(Stage 3.1:FAT32 / exFAT 的 FUSE 實作 ctime 不隨寫入更新)。
+    # 這裡掛真的檔案系統跑 tests/test_stage32_fs_semantics.py,不允許任何跳過。
+    # 範圍:FAT32 / exFAT 只有 FUSE 實作;Linux 核心的 vfat / exfat 驅動、macOS、Windows 都不在這裡。
+    name: 檔案系統語意(Linux,真的掛載)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: 安裝檔案系統工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fusefat exfat-fuse exfatprogs ntfs-3g dosfstools xfsprogs btrfs-progs
+      - name: 安裝 pytest
+        run: |
+          python -m pip install -r .github/ci-requirements.txt
+          python -m pytest --version
+      - name: 掛載測試用檔案系統
+        run: sudo "$(command -v python)" .github/scripts/mount_test_filesystems.py up "$RUNNER_TEMP/fs"
+      # 以 root 跑:重新掛載那幾條測試要能卸載再掛上
+      - name: 測試
+        run: >
+          sudo env CVK_FS_MOUNTS="$RUNNER_TEMP/fs/mounts.json"
+          "$(command -v python)" -m pytest tests/test_stage32_fs_semantics.py -rsxX -p no:cacheprovider
+          --basetemp "$RUNNER_TEMP/pytest-tmp" --junitxml fs-semantics.xml
+      - name: 結果摘要
+        if: always()
+        run: python .github/scripts/junit_summary.py cell fs-semantics.xml >> "$GITHUB_STEP_SUMMARY"
+      - name: 假綠燈檢查(這個 job 不允許任何跳過)
+        if: always()
+        run: python .github/scripts/junit_summary.py check fs-semantics.xml --os linux --no-skip
+      - name: 卸載
+        if: always()
+        run: sudo "$(command -v python)" .github/scripts/mount_test_filesystems.py down "$RUNNER_TEMP/fs"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: fs-semantics
+          path: fs-semantics.xml
+          if-no-files-found: error
+
   summary:
-    # 12 格合成一張表。test 有任何一格失敗也照跑(if: always()),這樣才看得到是哪一格
-    needs: test
+    needs: [test, fs-semantics]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -80,11 +182,20 @@ jobs:
           pattern: junit-*
           path: junit
           merge-multiple: true
-      - name: 跨平台矩陣摘要
+      - name: 跨平台矩陣摘要(12 格齊全、總數一致、同一作業系統的跳過一致)
         run: |
-          python3 .github/scripts/junit_summary.py matrix junit > cross-platform-summary.md
+          set +e
+          python3 .github/scripts/junit_summary.py matrix junit --expect-cells 12 > cross-platform-summary.md
+          rc=$?
           cat cross-platform-summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - name: 上游 job 都必須成功
+        if: always()
+        run: |
+          echo "test=${{ needs.test.result }} fs-semantics=${{ needs.fs-semantics.result }}"
+          [ "${{ needs.test.result }}" = success ] && [ "${{ needs.fs-semantics.result }}" = success ]
       - uses: actions/upload-artifact@v6
+        if: always()
         with:
           name: cross-platform-summary
           path: cross-platform-summary.md
