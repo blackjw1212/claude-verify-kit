@@ -218,3 +218,40 @@ def test_sim_untrusted_big_file_outside_the_manifest_is_content_hashed(hook, mon
         fh.write(b"x")
     os.utime(f, ns=(mt, mt))
     assert m._outside_hash("big.bin") != before
+
+
+# ---------------------------------------------------------------- 明確設 "auto" 時的相依目錄簽章
+#
+# 預設改成 false 之後,相依目錄的深度簽章在預設下會讀內容,原本那幾條端對端測試
+# (test_stage3_cache_security.py、test_stage2_audit.py)走的是重算那條路,
+# 守不住「信任 stat 時,簽章裡的大小 / mtime / ctime / inode」—— 反向測試 A2、S4-3 因此 MISSED。
+# 這兩條明確設 "auto":POSIX 上簽章只看 stat,擋下靠的就是那幾個欄位;Windows 上 auto 會讀內容。
+
+def _npm_project(project, fake):
+    import json as _json  # noqa: PLC0415
+    fake.make("npm")
+    configure(project, trust_mtime="auto")
+    write(project, "package.json", _json.dumps({"scripts": {"test": "x"}}))
+    dep = write(project, "node_modules/left-pad/index.js", "module.exports = 1;\n")
+    mt = _age(dep)
+    time.sleep(2.1)
+    assert not run_hook(project, env=fake.env).blocked
+    assert not run_hook(project, env=fake.env).blocked
+    assert fake.runs("npm") == 1                            # 前提:第二次走了快取
+    return dep, mt
+
+
+def test_explicit_auto_dependency_tree_same_size_rewrite_with_restored_mtime(project, fake):
+    dep, mt = _npm_project(project, fake)
+    dep.write_text("module.exports = 2;\n", encoding="utf-8")
+    os.utime(dep, ns=(mt, mt))
+    run_hook(project, env=fake.env)
+    assert fake.runs("npm") == 2
+
+
+def test_explicit_auto_dependency_tree_size_change(project, fake):
+    dep, mt = _npm_project(project, fake)
+    dep.write_text("module.exports = 1; // longer\n", encoding="utf-8")
+    os.utime(dep, ns=(mt, mt))
+    run_hook(project, env=fake.env)
+    assert fake.runs("npm") == 2
