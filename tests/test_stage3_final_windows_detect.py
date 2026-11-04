@@ -1,11 +1,12 @@
 """Stage 3 Final Acceptance — 任務二:無法可靠判斷內容有沒有變時,一律重新計算 SHA-256。
 
-trust_mtime:
-  "auto"(預設) 只在平台提供「使用者改不回去的變更時間」時才信任 stat:POSIX 有 ctime → 信任
-               (大小、mtime、ctime、inode 四項都相同才沿用雜湊);Windows 的 st_ctime 是建立時間 →
-               不信任,每次重算。相依目錄的深度簽章套同一條規則。
-  true         明確接受風險的快速模式(Windows 上同大小、還原 mtime 的改寫會漏判)
-  false        所有平台每次重算,連超過 64 MB、平常只比 stat 的大檔也重算
+trust_mtime(這個檔案寫於 Stage 3 Final,當時預設是 "auto";Stage 3.2 起預設改為 false):
+  false        預設。所有平台每次重算,連超過 64 MB 的大檔、相依目錄、專案外的小設定檔也讀內容
+  "auto"       POSIX 信任 stat(大小、mtime、ctime、inode 四項都相同才沿用雜湊)、Windows 重算。
+               只看平台:ctime 會不會隨寫入更新其實取決於檔案系統,FAT32 / exFAT 的 FUSE 實作不會
+               (test_stage32_fs_semantics.py)。Windows 的 st_ctime 是建立時間。
+  true         明確接受風險的快速模式(Windows 與 FAT32 / exFAT 上同大小、還原 mtime 的改寫會漏判)
+以下名稱裡的「default」指的是當下的預設值:現在是 false,Windows 上的結果與 auto 相同。
 
 測試分三類,報告裡分開計:
   [模擬]   在 Linux 上把 os.stat 換成 Windows 語意(ctime 不隨寫入改變)。證明的是判斷邏輯,不是 Windows 實機。
@@ -92,12 +93,17 @@ def test_sim_windows_explicit_true_is_the_documented_risk(hook, monkeypatch, tmp
 def test_trust_resolution_table(hook):
     t = hook.manifest_trust
     d = hook.DEFAULT_CONFIG
-    assert d["trust_mtime"] == "auto"
-    assert t(dict(d, trust_mtime="auto"), is_win=False) is True       # POSIX:ctime 可靠
+    # Stage 3.2:預設由 "auto" 改為 False(auto 在 FAT32 / exFAT 的 FUSE 實作上實測漏判,S31-1)
+    assert d["trust_mtime"] is False
+    assert t(dict(d, trust_mtime="auto"), is_win=False) is True       # auto 的行為不變:POSIX 信任 stat
     assert t(dict(d, trust_mtime="auto"), is_win=True) is False       # Windows:沒有可靠的變更時間
     for win in (True, False):
         assert t(dict(d, trust_mtime=True), is_win=win) is True
         assert t(dict(d, trust_mtime=False), is_win=win) is False
+        assert t(d, is_win=win) is False                               # 預設:所有平台都重算
+        assert t({}, is_win=win) is False                              # 沒有這個鍵:安全的那一邊
+        for odd in ("false", "true", "AUTO", "auto ", 1, 0, None, [], {}):
+            assert t(dict(d, trust_mtime=odd), is_win=win) is False, odd   # 不認得的值一律不信任
 
 
 def test_trust_mtime_accepts_auto_true_false_only(project):

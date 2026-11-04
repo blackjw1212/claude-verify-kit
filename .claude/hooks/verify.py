@@ -77,7 +77,7 @@ import xml.parsers.expat
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-VERSION = "3.0.0-dev.1"
+VERSION = "3.0.0-dev.2"
 IS_WIN = os.name == "nt"
 
 # Windows 主控台 Python 的 stdio 預設 cp950(Big5),Claude Code 以 UTF-8 讀寫。
@@ -129,11 +129,14 @@ DEFAULT_CONFIG = {
     "max_heavy": 1,                 # 其中重型(韌體建置、測試)最多幾個
     "cache": True,                  # False = 每次都驗全部(不沿用快取結果)
     "override_cache": False,        # True = 檔案與環境都沒變時不重跑自訂驗證(它讀什麼無從得知,預設不快取)
-    # 檔案沒變的判斷要不要信任 stat:
-    #   "auto" = 只在平台有「使用者改不回去的變更時間」時信任(POSIX 的 ctime);Windows 沒有 → 每次重算 SHA-256
-    #   True   = 一律信任 stat(快;Windows 上同大小、還原 mtime 的改寫會漏判 —— 明確接受這個風險才設)
-    #   False  = 一律重算,連超過 64 MB 的大檔也算(最慢、最保守)
-    "trust_mtime": "auto",
+    # 檔案沒變的判斷要不要信任 stat(大小、mtime、ctime、inode):
+    #   False  = 預設(Stage 3.2 起)。一律重算 SHA-256:專案檔、超過 64 MB 的大檔、相依目錄、
+    #            專案外的小設定檔都讀內容。不依賴任何時間戳記是否可靠。
+    #   "auto" = Stage 3 Final 的預設:Linux / macOS 信任 stat,Windows 重算。只看平台、不看檔案系統 ——
+    #            實測在 FAT32 / exFAT 的 FUSE 實作上(ctime 恆等於 mtime)會漏判同大小、還原 mtime 的改寫。
+    #   True   = 一律信任 stat(最快;Windows、FAT / exFAT 上都會漏判 —— 明確接受這個風險才設)
+    # 不認得的值會被忽略、改用預設值,所以退路永遠是重算那一邊。
+    "trust_mtime": False,
     "debug": False,                 # 或環境變數 CLAUDE_VERIFY_DEBUG=1:把跳過/沿用的理由寫進紀錄
     "dep_scan_cap": 300000,         # 相依目錄(node_modules…)逐檔掃描的上限;超過 → 該驗證器每次都跑
     "kill_leftover_processes": True,  # 工具結束後收掉它留下的背景程序;False = Stage 2 的行為(不收)
@@ -385,7 +388,7 @@ def _kill_tree(proc):
 #          job 裡的程序(工具與它的子孫)由系統一起結束。
 _ACTIVE = set()
 _ACTIVE_LOCK = threading.RLock()
-_RUN = {"reap": True, "project": None, "parent": None, "parent_handle": None, "trust": True}
+_RUN = {"reap": True, "project": None, "parent": None, "parent_handle": None, "trust": False}
 
 _WATCHDOG_SRC = r"""
 import os, signal, sys, time
@@ -904,7 +907,8 @@ class Ctx:
     @property
     def manifest(self):
         if self._manifest is None:  # 沒有上次紀錄 → 全部視為新檔(只在直接呼叫檢查函式時發生)
-            self._manifest = Manifest(self.project).scan(self.files() + claude_extras(self.project))
+            self._manifest = Manifest(self.project, None, _RUN["trust"]).scan(
+                self.files() + claude_extras(self.project))
         return self._manifest
 
     @manifest.setter
@@ -1034,8 +1038,9 @@ def claude_extras(project):
 #     當下可能還沒寫完 → 拿它當來源會漏擋。
 #   - git status 列的是「所有未 commit 的變更」而非這一輪的,且看不到被 .gitignore 排除、
 #     但驗證器照樣會檢查的檔案 → 一樣會漏。
-# 內容雜湊兩者都不會漏:誰改的、怎麼改的都一樣。stat(大小+mtime)沒變的檔案沿用上次的
-# 雜湊,不重讀(同 git index);但「上次觀察時才剛被改過」(racy,2 秒內)的一律重讀。
+# 內容雜湊兩者都不會漏:誰改的、怎麼改的都一樣。預設(trust_mtime=false)每次重算每個檔案的
+# SHA-256;明確設定信任 stat 時,stat 沒變的檔案才沿用上次的雜湊(同 git index),而「上次觀察時
+# 才剛被改過」(racy,2 秒內)的仍一律重讀。
 
 CACHE_NAME = ".verify_cache.json"
 # 2(Stage 3-4):內容雜湊改為 SHA-256;manifest 每筆多記 ctime 與 inode。格式 1 的快取一律不信任。
@@ -1054,12 +1059,17 @@ HEAVY = {"firmware", "rust", "node", "pytest", "override"}
 
 
 def manifest_trust(cfg, is_win=None):
-    """這次可不可以用 stat 判斷「檔案沒變」。auto:POSIX 的 ctime 在寫入時一定更新、一般使用者改不回去 →
-    可信;Windows 的 st_ctime 是建立時間,沒有可用的變更時間 → 不可信,每次重算 SHA-256。"""
-    v = cfg.get("trust_mtime", "auto")
-    if v is True or v is False:
-        return v
-    return not (IS_WIN if is_win is None else is_win)
+    """這次可不可以用 stat 判斷「檔案沒變」。只有明確設定才會信任:
+      True   → 信任
+      "auto" → Linux / macOS 信任、Windows 不信任。它只看平台:ctime 會不會隨寫入更新其實取決於
+               檔案系統,實測 FAT32 / exFAT 的 FUSE 實作不會(Windows 的 st_ctime 則是建立時間)
+      其他   → 不信任(包括預設的 False 與任何不認得的值):每次重算 SHA-256"""
+    v = cfg.get("trust_mtime", False)
+    if v is True:
+        return True
+    if v == "auto":
+        return not (IS_WIN if is_win is None else is_win)
+    return False
 
 
 def _hash_file(path, size, mtime_ns, ctime_ns=0, ino=0, content=False):
@@ -1081,12 +1091,13 @@ def _hash_file(path, size, mtime_ns, ctime_ns=0, ino=0, content=False):
 class Manifest:
     """每個檔案的 [大小, mtime_ns, ctime_ns, inode, 觀察時間_ns, SHA-256]。
 
-    trust_mtime=True 時,stat 四項都和上次相同(而且上次觀察時已經離修改超過 2 秒)才沿用上次的雜湊。
-    ctime 是 POSIX 的「狀態變更時間」:寫入一定會更新它,而且使用者改不回去 —— 所以同大小、
-    又用 touch -r / cp -p / tar 還原 mtime 的就地改寫也看得到。inode 抓得到「寫暫存檔再改名」的寫法。
-    Windows 的 st_ctime 是建立時間,沒有這層保護(已知限制;要完全保險設 trust_mtime=false)。"""
+    trust_mtime=False(預設):每個檔案每次都重算 SHA-256,stat 只拿來記錄。
+    trust_mtime=True:stat 四項都和上次相同(而且上次觀察時已經離修改超過 2 秒)才沿用上次的雜湊。
+    這要靠 ctime 隨寫入更新,才看得到同大小、又用 touch -r / cp -p / tar 還原 mtime 的就地改寫 ——
+    但那是檔案系統的行為,不是 POSIX 的保證:實測 ext4、xfs、btrfs、tmpfs、overlay、ntfs-3g 會更新,
+    FAT32 / exFAT 的 FUSE 實作不會;Windows 的 st_ctime 是建立時間。inode 抓得到「寫暫存檔再改名」。"""
 
-    def __init__(self, project, prev=None, trust_mtime=True):
+    def __init__(self, project, prev=None, trust_mtime=False):
         self.project = project
         self.prev = prev if isinstance(prev, dict) else {}
         self.trust = trust_mtime
@@ -1110,7 +1121,7 @@ class Manifest:
                     and (old[4] - max(old[1], old[2])) >= RACY_NS):
                 h = old[5]
             else:
-                # 不信任 stat 時(Windows 的 auto、或 false)大檔也要真的讀內容,不能用 stat 代替雜湊
+                # 不信任 stat 時(預設的 false、或 Windows 上的 auto)大檔也要真的讀內容,不能用 stat 代替雜湊
                 h = _hash_file(path, *stat4, content=not self.trust)
                 self.hashed += 1
             entries[rel] = stat4 + [now, h]
@@ -1137,7 +1148,8 @@ class Manifest:
             return "-"
         if not os.path.isfile(path):
             return "dir"
-        return _hash_file(path, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
+        # 不信任 stat 時,超過 64 MB 的也要讀內容(Stage 3.2 之前這裡一律只比 stat)
+        return _hash_file(path, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, content=not self.trust)
 
     def digest(self, rels=None):
         h = hashlib.sha256(VERSION.encode())
@@ -1313,7 +1325,10 @@ DEP_DIR_NAMES = ("node_modules", "managed_components")
 
 
 def exe_identity(name):
-    """工具的實際路徑 + 大小 + mtime。升級、換版本(symlink 指到別處)→ 識別改變。找不到回 None。"""
+    """工具的實際路徑 + 大小 + mtime + ctime + inode。升級、換版本(symlink 指到別處)→ 識別改變。找不到回 None。
+    刻意只看 stat、不讀內容,也不受 trust_mtime 影響:工具執行檔常有數十到上百 MB(node、shellcheck、
+    clang),每次 Stop 都讀會是固定成本;而且共用函式庫(.so / .dll)本來就不在這個識別裡。
+    已知限制:放在不更新 ctime 的檔案系統上、被同大小且還原 mtime 地替換的執行檔看不出來。"""
     name = str(name)
     has_sep = ("/" in name) or ("\\" in name)
     path = name if (has_sep and os.path.isfile(name)) else (None if has_sep else shutil.which(name))
@@ -1327,12 +1342,20 @@ def exe_identity(name):
         return f"{path}->{real}"
 
 
+PATH_SIG_CONTENT_MAX = 1024 * 1024
+
+
 def path_sig(path):
+    """專案外單一路徑的簽章(~/.npmrc、rustup 的 settings.toml、pyvenv.cfg、套件的 package.json…)。
+    不信任 stat 時(預設),1 MiB 以內的一般檔案連內容一起算 SHA-256;目錄與更大的檔案只看 stat。"""
     try:
         st = os.stat(path)
-        return f"{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}:{st.st_ino}"
     except OSError:
         return "-"
+    sig = f"{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}:{st.st_ino}"
+    if not _RUN["trust"] and stat.S_ISREG(st.st_mode) and st.st_size <= PATH_SIG_CONTENT_MAX:
+        sig += ":" + _hash_file(path, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, content=True)
+    return sig
 
 
 def env_sig(prefixes=(), names=()):
@@ -1395,7 +1418,7 @@ def tree_sig(path, cap=None):
             h.update(f"{rel}/{fn}\0{st.st_size}\0{st.st_mtime_ns}\0{st.st_ctime_ns}\0{st.st_ino}\n"
                      .encode("utf-8", "surrogateescape"))
             if not _RUN["trust"] and stat.S_ISREG(st.st_mode):
-                # 不信任 stat(Windows 的 auto、或 trust_mtime=false):連內容一起算
+                # 不信任 stat(預設的 false、或 Windows 上的 auto):連內容一起算
                 h.update(_hash_file(os.path.join(dirpath, fn), st.st_size, st.st_mtime_ns,
                                     st.st_ctime_ns, st.st_ino, content=True).encode())
             n += 1

@@ -114,7 +114,8 @@ def test_trust_mtime_false_catches_same_size_same_mtime_edit(project, fake):
 def test_known_limitation_trust_mtime_misses_old_same_size_same_mtime_edit(project, fake):
     # Stage 2 時的已知限制(與 git index 相同):內容改了但大小與 mtime 都被刻意還原成「很久以前」,
     # 預設模式看不到。Stage 3-4 起 POSIX 靠 ctime 擋下;Final Acceptance 起 Windows 的預設(auto)
-    # 不信任 stat、每次重算 SHA-256 —— 所以現在所有平台都斷言「擋得下」。
+    # 不信任 stat、每次重算 SHA-256;Stage 3.2 起預設改為 false,所有平台都重算 ——
+    # 所以所有平台都斷言「擋得下」。明確設 "auto" 的情況見 test_stage32_trust_modes.py。
     # 明確設 trust_mtime=true 的風險寫在 test_stage3_final_windows_detect.py(Windows 實機)。
     r = _same_size_same_mtime_edit(project, fake)
     assert r.blocked and "a.json" in r.reason
