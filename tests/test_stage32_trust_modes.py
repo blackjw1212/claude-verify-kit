@@ -149,3 +149,72 @@ def test_unrecognised_trust_value_is_reported_and_the_default_is_used(hook, tmp_
     assert cfg["trust_mtime"] is False
     assert hook.manifest_trust(cfg) is False
     assert any("trust_mtime" in n for n in notes)
+
+
+# ---------------------------------------------------------------- 安全的預設值也落到每一個入口
+
+def test_every_entry_point_defaults_to_not_trusting_stat(tmp_path):
+    from conftest import load_hook  # noqa: PLC0415
+    fresh = load_hook()                                    # 新載入:_RUN 沒被其他測試動過
+    assert fresh._RUN["trust"] is False
+    assert fresh.Manifest(tmp_path).trust is False
+    assert fresh.Ctx(tmp_path, dict(fresh.DEFAULT_CONFIG), 0).manifest.trust is False
+
+
+# ---------------------------------------------------------------- [模擬] 另外兩條原本只看 stat 的路徑
+#
+# 真的檔案系統上的版本在 test_stage32_fs_semantics.py(FAT32 / exFAT,需要掛載,只在專門的 CI job 跑)。
+# 這裡用「ctime 固定不變」的 stat 替身(FAT 與 Windows 的語意)在所有平台上驗同一件事,
+# 範圍限定在 tmp_path 底下,pytest 自己的 os.stat 不受影響。
+
+class _PinnedCtime:
+    def __init__(self, st, ctime_ns):
+        self._st, self.st_ctime_ns, self.st_ctime = st, ctime_ns, ctime_ns / 1e9
+
+    def __getattr__(self, name):
+        return getattr(self._st, name)
+
+
+def _pin_ctime(monkeypatch, hook, under):
+    real, pinned = os.stat, {}
+
+    def fake(path, *a, **k):
+        st = real(path, *a, **k)
+        key = os.path.abspath(str(path))
+        if not key.startswith(str(under)):
+            return st
+        pinned.setdefault(key, st.st_ctime_ns)
+        return _PinnedCtime(st, pinned[key])
+    monkeypatch.setattr(hook.os, "stat", fake)
+
+
+def test_sim_untrusted_config_file_signature_reads_content(hook, monkeypatch, tmp_path):
+    f = tmp_path / "settings.toml"
+    f.write_bytes(b'toolchain = "1.85"\n')
+    mt = _age(f)
+    _pin_ctime(monkeypatch, hook, tmp_path)
+    monkeypatch.setitem(hook._RUN, "trust", False)
+    before = hook.path_sig(f)
+    f.write_bytes(b'toolchain = "1.86"\n')
+    os.utime(f, ns=(mt, mt))
+    assert hook.path_sig(f) != before
+    monkeypatch.setitem(hook._RUN, "trust", True)              # 對照:信任 stat 時看不出來(文件寫明的取捨)
+    trusted = hook.path_sig(f)
+    f.write_bytes(b'toolchain = "1.87"\n')
+    os.utime(f, ns=(mt, mt))
+    assert hook.path_sig(f) == trusted
+
+
+def test_sim_untrusted_big_file_outside_the_manifest_is_content_hashed(hook, monkeypatch, tmp_path):
+    f = tmp_path / "big.bin"
+    with open(f, "wb") as fh:
+        fh.truncate(hook.BIG_FILE + 1024 * 1024)
+    mt = _age(f)
+    _pin_ctime(monkeypatch, hook, tmp_path)
+    m = hook.Manifest(tmp_path, None, False)
+    before = m._outside_hash("big.bin")
+    with open(f, "r+b") as fh:
+        fh.seek(hook.BIG_FILE // 2)
+        fh.write(b"x")
+    os.utime(f, ns=(mt, mt))
+    assert m._outside_hash("big.bin") != before
