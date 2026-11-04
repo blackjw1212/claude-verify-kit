@@ -1051,7 +1051,7 @@ RACY_NS = 2 * 10 ** 9
 # 驗證器邏輯版本:改了某個驗證器的判定方式就 +1,它的舊快取自動失效。
 VALIDATOR_VERSIONS = {
     "firmware": 1, "plist": 1, "opencore": 1, "acpi": 1, "xml": 1, "json": 1,
-    "adblock": 1, "xlsx": 1, "shell": 1, "python": 1, "pytest": 1, "node": 1,
+    "adblock": 1, "xlsx": 1, "shell": 2, "python": 1, "pytest": 1, "node": 1,
     "rust": 1, "override": 1, "hooks": 1,
 }
 # 重型:會吃滿 CPU 的建置/測試,同時最多跑 max_heavy 個(預設 1),避免互搶到逾時。
@@ -1975,6 +1975,22 @@ def _rc_digest(ctx, *names):
     return ctx.manifest.digest(rels) if rels else ""
 
 
+def _shellcheck_config_sig(ctx):
+    """shellcheck 也讀專案外的設定:SHELLCHECK_OPTS、家目錄的 .shellcheckrc、XDG 的 shellcheckrc、專案上層
+    目錄裡的 .shellcheckrc / shellcheckrc。它們會改變結果(可以把警告整個關掉);不算進工具識別的話,
+    拿掉之後會一直沿用當時的「通過」(Stage 3.2 實測重現,三種都是)。"""
+    home = _home()
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME") or (home / ".config"))
+    parts = [_rc_digest(ctx, ".shellcheckrc", "shellcheckrc"), env_sig(names=("SHELLCHECK_OPTS",)),
+             "home=" + path_sig(home / ".shellcheckrc"), "xdg=" + path_sig(xdg / "shellcheckrc")]
+    up = Path(os.path.abspath(str(ctx.project))).parent
+    for d in [up, *up.parents]:
+        for name in (".shellcheckrc", "shellcheckrc"):
+            if os.path.exists(d / name):
+                parts.append(f"{d / name}={path_sig(d / name)}")
+    return "|".join(parts)
+
+
 def _asl_digest(ctx):
     """ASL 的 Include 會把 .asl/.asi 拉進來:它們改了,所有 .dsl 都要重編。"""
     rels = [r for r in ctx.files() if r.lower().endswith((".asl", ".asi"))]
@@ -1989,8 +2005,7 @@ FILE_VALIDATORS = {
     "json": ("JSON 格式", ("*.json",), run_json, lambda ctx: ("builtin|" + ",".join(JSONC_NAMES), None)),
     "xlsx": ("Excel xlsx", ("*.xlsx",), run_xlsx, _xlsx_tool),
     "shell": ("shellcheck", ("*.sh",), run_shell,
-              _exe_tool("shell", "shellcheck", "shellcheck",
-                        lambda ctx: _rc_digest(ctx, ".shellcheckrc", "shellcheckrc"))),
+              _exe_tool("shell", "shellcheck", "shellcheck", _shellcheck_config_sig)),
     "python": ("Python 語法", ("*.py",), run_python_syntax, _python_tool),
     "hooks": ("Claude Code hooks 設定", (), lambda ctx, rels: run_hook_settings(ctx, rels),
               lambda ctx: (_hooks_ident(ctx), None)),
