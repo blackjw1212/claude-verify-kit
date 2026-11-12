@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -86,7 +87,10 @@ class Suite:
     def version(self, key, cmd, env=None):
         try:
             out = self.sh(cmd, env=env, check=False, label=f"[版本] {' '.join(map(str, cmd))}")
-            self.versions[key] = out.strip().splitlines()[0][:120] if out.strip() else "?"
+            lines = out.strip().splitlines()
+            # 取第一個含版本號的行(shellcheck --version 的第一行只有標題,版本在第二行)
+            pick = next((ln for ln in lines if re.search(r"\d+\.\d+", ln)), lines[0] if lines else "?")
+            self.versions[key] = pick.strip()[:120]
         except Exception as ex:  # noqa: BLE001
             self.versions[key] = f"?({ex})"
 

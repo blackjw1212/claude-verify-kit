@@ -5,14 +5,15 @@ Stop-hook verifier v3 — 跨產物類型的「可驗證成功標準」閘門。
 
 Claude 宣告完成(Stop 事件)時執行;驗證失敗就擋下,讓 Claude 繼續修正。
 依專案內實際存在的檔案自動派發對應檢查(韌體、OpenCore、ACPI、XML、JSON、
-AdGuard、xlsx、shell、Python、Node、Rust)。
+AdGuard、xlsx、shell、Python、Node、Rust,以及 Claude Code 自己的設定與 hook 程式)。
 
 優先序:
   1) .claude/skip-verify 存在            → 放行(硬體專屬改動 / WIP 用)。
   2) 防迴圈:stop_hook_active 為 true,且上次擋下之後專案沒有任何新修改
      → 放行並告知使用者(不重跑、不再擋)。有新修改才重新驗證。
-  3) .claude/verify(.sh/.py/.cmd/.bat)  → 只跑它,exit code 即裁決。
-  4) 否則                                → 跑所有「適用」的內建檢查並聚合結果。
+  3) .claude/verify(.sh/.py/.cmd/.bat)  → 每次都跑它;預設(custom_verify_mode=augment)內建檢查也照跑,
+                                           任一邊失敗都擋。設成 replace 才是只跑它(Stage 1–3 的行為)。
+  4) 沒有自訂驗證                        → 跑所有「適用」的內建檢查並聚合結果。
 
 只驗變更的部分(Stage 2):
   - 變更以「檔案內容雜湊」判定(.claude/.verify_cache.json),不看 transcript 或 git:
@@ -134,7 +135,7 @@ DEFAULT_CONFIG = {
     #            專案外的小設定檔都讀內容。不依賴任何時間戳記是否可靠。
     #   "auto" = Stage 3 Final 的預設:Linux / macOS 信任 stat,Windows 重算。只看平台、不看檔案系統 ——
     #            實測在 FAT32 / exFAT 的 FUSE 實作上(ctime 恆等於 mtime)會漏判同大小、還原 mtime 的改寫。
-    #   True   = 一律信任 stat(最快;Windows、FAT / exFAT 上都會漏判 —— 明確接受這個風險才設)
+    #   True   = 一律信任 stat(最快;Windows 上會漏判,實測 FAT32 / exFAT 的 FUSE 實作上也會 —— 明確接受這個風險才設)
     # 不認得的值會被忽略、改用預設值,所以退路永遠是重算那一邊。
     "trust_mtime": False,
     "debug": False,                 # 或環境變數 CLAUDE_VERIFY_DEBUG=1:把跳過/沿用的理由寫進紀錄
@@ -1045,7 +1046,7 @@ def claude_extras(project):
 CACHE_NAME = ".verify_cache.json"
 # 2(Stage 3-4):內容雜湊改為 SHA-256;manifest 每筆多記 ctime 與 inode。格式 1 的快取一律不信任。
 CACHE_FORMAT = 2
-BIG_FILE = 64 * 1024 * 1024     # 超過就不讀內容,只比 stat(大小、mtime、ctime、inode)
+BIG_FILE = 64 * 1024 * 1024     # 信任 stat 時,超過就不讀內容、只比 stat;不信任 stat 時(預設)照樣讀內容
 RACY_NS = 2 * 10 ** 9
 
 # 驗證器邏輯版本:改了某個驗證器的判定方式就 +1,它的舊快取自動失效。
@@ -1388,7 +1389,8 @@ _SCAN_CAP = [DEP_SCAN_CAP]   # main() 依設定 dep_scan_cap 覆寫
 
 
 def tree_sig(path, cap=None):
-    """目錄底下每個檔案的(相對路徑, 大小, mtime)。超過上限回 UNTRACKABLE;不存在回 "-"。"""
+    """目錄底下每個檔案的(相對路徑、大小、mtime、ctime、inode);不信任 stat 時(預設)連內容的 SHA-256 一起算。
+    超過上限(算的是檔案數,不是位元組數)回 UNTRACKABLE;不存在回 "-"。"""
     cap = _SCAN_CAP[0] if cap is None else cap
     key = (str(path), cap, _RUN["trust"])
     if key in _TREE_MEMO:
@@ -1414,7 +1416,8 @@ def tree_sig(path, cap=None):
                 st = os.lstat(os.path.join(dirpath, fn))
             except OSError:
                 continue
-            # ctime / inode:同大小、還原 mtime 的就地改寫(套件管理器、tar 解壓)也看得到(POSIX)
+            # ctime / inode:信任 stat 時,靠它們看到同大小、還原 mtime 的就地改寫(套件管理器、tar 解壓);
+            # ctime 會不會隨寫入更新取決於檔案系統(實測 FAT32 / exFAT 的 FUSE 實作不會)
             h.update(f"{rel}/{fn}\0{st.st_size}\0{st.st_mtime_ns}\0{st.st_ctime_ns}\0{st.st_ino}\n"
                      .encode("utf-8", "surrogateescape"))
             if not _RUN["trust"] and stat.S_ISREG(st.st_mode):
