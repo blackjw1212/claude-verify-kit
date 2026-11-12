@@ -14,7 +14,7 @@
 | Gmail 過濾 / 一般 XML | well-formed | Python 內建（免裝） | 是 |
 | AdGuard / adblock 規則 | 語法合法 | `aglint`（需 `.aglintrc`，含 error-token 保險） | **未實測**（只有假工具） |
 | Excel xlsx | 可載入不損毀 | `openpyxl` | **未實測**（沒有任何測試） |
-| Shell / Python / Node / Rust | lint / 編譯 / 測試 | `shellcheck` / `py_compile`+`pytest` / `npm test` / `cargo test` | 是（shellcheck 0.10／0.11、pytest 8／9、npm 10、cargo 1.85／1.86） |
+| Shell / Python / Node / Rust | lint / 編譯 / 測試 | `shellcheck` / `py_compile`+`pytest` / `npm test` / `cargo test` | 是（shellcheck 0.10／0.11、pytest 8／9、npm 10、Rust toolchain 1.85／1.86） |
 | Claude Code 本身的設定 | hook 程式（`.claude/*.py`、`.claude/hooks/*.py`）語法正確；`.claude/*.json` 是合法 JSON；`settings.json`／`settings.local.json` 的 hooks 結構正確、指向的腳本存在 | Python 內建（免裝） | 是 |
 
 工具或設定缺失 → 該維度**軟性略過**（印警告不擋）。結構合法 **≠** 行為正確；硬體與規則的實際效果仍須上機/實測。
@@ -121,7 +121,7 @@ Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":
   - 被略過的目錄（`dist/`、`build/`、`.cache/`…）裡的檔案，只有被建置設定明確引用時才會追蹤；測試若讀取那些目錄，請設 `"cache": false`。
   - 工具執行檔只看 stat、不讀內容，也不受 `trust_mtime` 影響；工具鏈目錄清單（PlatformIO 的 `packages/`、rustup 的 toolchains…）裡的子目錄也只看 stat。相依目錄與專案外的小設定檔預設讀內容（見上）。
 - **相關設定**（`.claude/verify.json`）：`max_parallel`、`max_heavy`、`cache`、`override_cache`、`custom_verify_mode`（`"augment"`／`"replace"`）、`trust_mtime`（預設 `false`；`"auto"`／`true`）、`dep_scan_cap`、`kill_leftover_processes`、`debug`（或環境變數 `CLAUDE_VERIFY_DEBUG=1`）。紀錄檔 `.claude/.verify.log` 的每個工具結果會寫 `pid`、耗時、結束原因（`exit`／`signal N`／`timeout_killed`）。
-- **效能**：`python3 bench/benchmark.py`，結果見下表。
+- **效能**：`python3 bench/benchmark.py`。下面第一張表是 Stage 1–2 當時各自量的歷史紀錄（**不含 Stage 3 之後的版本**）；目前這一版的數字在第二張表。
 
 合成專案 719 個檔案，CPU 4 核，每格為中位數，單位秒。韌體建置用固定 3 秒的假 `pio`；「未重建」表示那一次根本沒有呼叫建置工具。
 
@@ -135,9 +135,23 @@ Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":
 | 刪掉快取（完整重驗） | 7.88 | 4.00 | 3.96 | 3.96 |
 | 冷啟動 | 7.92 | 4.07 | 3.85 | 3.99 |
 
-大型專案（約 1 萬個專案檔＋4 萬個 `node_modules` 檔）：無變更 0.68 s（初版 0.22 s，多出來的是逐檔掃描 `node_modules`），只改一個 JSON 2.30 s（原版 30.0 s）。
+同一個 719 檔專案，三個版本在同一台機器、同一次執行裡量（2026-11-11，各 5 次中位數；冷啟動只跑 1 次）：
 
-自訂驗證（`.claude/verify.sh`）的實際專案：`override_cache: false`（預設）每次約 16.5 s；設成 `true`，無變更時約 0.13 s。
+| 情境 | Stage 2 驗收後 `2f94628` | Stage 3 Final `c7640eb`（預設 `"auto"`） | Stage 3.2（預設 `false`） |
+|---|---|---|---|
+| 無變更 | 0.13 | 0.14 | 0.76 |
+| 只改一個 JSON | 0.73 | 0.75 | 1.37 |
+| 改一個 Python 原始碼 | 0.77 | 0.75 | 1.39 |
+| 改韌體原始碼 | 3.75 | 3.77 | 4.38 |
+| 工具版本變更（只換 pio） | 3.17 | 3.15 | 3.79 |
+| 刪掉快取（完整重驗） | 3.79 | 3.79 | 4.40 |
+| 冷啟動 | 4.18 | 3.96 | 8.99 |
+
+Stage 3.2 每一列都多出約 0.6 秒，**與專案大小無關**：預設 `trust_mtime: false` 每次 Stop 都重讀專案直譯器的相依環境（site-packages）的內容——量測的那台機器上是 8,711 個檔、595 MB。**冷啟動那一格（8.99 s）只有一個樣本，而且偏高，原因沒有確認（疑點）**：事後清掉頁面快取重做，小專案的冷啟動只從 1.22 s 變成 1.74 s，解釋不了多出來的 5 秒；推測是量測前機器剛重啟、那 595 MB 第一次從磁碟讀出。同一次量測裡「刪掉快取」那一列（4.40 s）是暖機之後的完整重驗，比較能代表平常的成本。
+
+大型專案（約 1 萬個專案檔＋4 萬個 `node_modules` 檔，同一次量測，各 3 次中位數）：無變更 `2f94628` 0.51 s → `c7640eb` 0.61 s → Stage 3.2 1.61 s；只改一個 JSON 2.19 → 2.21 → 3.26 s。（Stage 2 當時量到的是：無變更 0.68 s——初版 `c202ef0` 是 0.22 s，多出來的是逐檔掃描 `node_modules`——只改一個 JSON 2.30 s，原版 `bf696de` 30.0 s。）
+
+自訂驗證（`.claude/verify.sh`）的實際專案（351 個檔、54 MB）：`override_cache: false`（預設）每次約 16.5 s；設成 `true`，無變更時 Stage 3 Final 是 0.16 s、Stage 3.2 是 0.89 s（Stage 2 當時量到 0.13 s）。
 
 Stage 3（SHA-256、ctime／inode、看門程序）對 Stage 2 驗收後（`2f94628`），5 萬個專案檔＋4 萬個 `node_modules` 檔，各 20 次的中位數：
 
@@ -183,7 +197,22 @@ SHA-256 證明的是「內容一致」，不是「是誰寫的」。能寫 `.cla
 
 FAT32／exFAT 的結果只來自兩個 FUSE 實作（fusefat、exfat-fuse），**不代表所有實體裝置或其他驅動**。不認得的值（例如字串 `"false"`）會被忽略並改用預設值，所以退路永遠是重算那一邊（Stage 3.2 之前退回的是 `"auto"`）。
 
-成本（Linux、4 核，5 萬個專案檔＋4 萬個 `node_modules` 檔，各 10 次中位數；`c7640eb` 的預設 `"auto"` → Stage 3.2 的預設 `false`）：無變更的 Stop 1.83 → 3.28 s、改一個 JSON 6.51 → 8.34 s、工具版本變更 3.03 → 5.11 s、冷啟動 8.27 → 10.29 s。多出來的時間是每次重讀約 9 萬個檔案的內容。Windows 開檔比 Linux 慢，實際成本**未實測**。重現：`python3 bench/stage3_perf.py --revs c7640eb,WORKTREE --repeat 10`。
+**成本**（全部在 Linux、4 核的同一台虛擬機上量；Windows 與 macOS **未實測**，Windows 開檔比 Linux 慢）：
+
+| 量什麼 | `"auto"` | `false`（預設） |
+|---|---|---|
+| 合成專案（5 萬專案檔＋4 萬 `node_modules` 檔，**每個檔都很小**）無變更的 Stop：兩個版本各用自己的預設值，各 10 次中位數（2026-11-04） | 1.83 s（`c7640eb`） | 3.28 s |
+| 同一個合成專案、同一版程式只換設定，各 7 次中位數（2026-11-11；同一次量測裡 `c7640eb` 是 1.80 s、設成 `true` 是 1.74 s） | 1.78 s | 3.01 s |
+| 真實的相依環境：3 個檔的專案，直譯器是裝了 numpy／scipy／pandas／matplotlib 的 venv（11,241 個檔、403 MB），無變更的 Stop，各 7 次中位數 | 0.18 s | 0.74 s |
+| 真實工具鏈（各只有 1 個樣本；`"auto"` 那欄是 `c7640eb` 的驗收紀錄）：系統 Python＋使用者 site／ESP-IDF v5.4.4 專案，無變更的 Stop | 0.13 s／0.36 s | 0.76 s／1.04 s |
+
+讀這張表要知道三件事：
+
+- **同一版程式設成 `"auto"` 與 `c7640eb` 一樣快**（同一次量測 1.78 對 1.80 s），所以變慢完全來自這個設定本身，不是 Stage 3.2 的其他修改。第一列同一次量測的其他情境（`c7640eb` → Stage 3.2）：改一個 JSON 6.51 → 8.34 s、工具版本變更 3.03 → 5.11 s、冷啟動 8.27 → 10.29 s。
+- **成本跟「位元組數」成正比，不只是檔案數。**合成專案的檔案都只有幾十個位元組，量到的主要是開檔的成本；真實的相依環境是幾百 MB 到幾 GB。上面那個 403 MB 的 venv 多出 0.56 s，約每 100 MB 多 0.14 s（內容已在頁面快取裡）；內容還沒進快取時（例如剛開機），同樣的 403 MB 算一遍 SHA-256 是 1.27 s，已在快取裡是 0.51 s（虛擬機的磁碟；一般硬碟會更慢，未實測）。**幾 GB 的環境（例如大型機器學習套件）沒有實測**，依這個比例每次 Stop 會多出數秒。
+- 被重讀的包括：專案檔、`node_modules`、`managed_components`、`.pio/libdeps`、專案直譯器的所有 site-packages、ESP-IDF 的 `components/` 與 `tools/`、PlatformIO 與 Arduino 的框架套件。超過 `dep_scan_cap`（預設 30 萬個檔）的相依目錄不追蹤（那個驗證器改成每次都跑）；**沒有依位元組數設上限**。
+
+環境很大、而且專案確定放在上表「實測會更新 ctime」的本機檔案系統上時，可以明確設 `"trust_mtime": "auto"` 換回原本的速度——代價是上面寫的漏判風險。重現：`python3 bench/stage3_perf.py --revs c7640eb,WORKTREE --repeat 10`。
 
 ### 平台支援狀態
 
