@@ -19,7 +19,9 @@ HIDE = "disable=SC2086,SC2154\n"
 
 def _proj(tmp_path):
     proj = tmp_path / "outer" / "proj"
-    write(proj, "a.sh", BAD)
+    # 給真的 shellcheck 讀的檔案一律寫位元組:文字模式在 Windows 會寫成 CRLF,shellcheck 改報 SC1017
+    # (第一次跨平台 CI 實測),測試就變成在驗換行而不是驗設定。
+    write(proj, "a.sh", BAD.encode("utf-8"))
     home = tmp_path / "home"
     home.mkdir()
     return proj, home
@@ -36,7 +38,8 @@ def _hook(proj, home, **env):
 def test_baseline_the_script_really_has_warnings(tmp_path):
     proj, home = _proj(tmp_path)
     r = _hook(proj, home)
-    assert r.blocked and "a.sh" in r.reason
+    assert r.blocked and "a.sh" in r.reason and "SC2086" in r.reason, r.reason
+    assert "SC1017" not in r.reason, r.reason        # CRLF 時 SC2086 照樣會出現,要另外確認輸入真的是 LF
 
 
 @needs_shellcheck
@@ -44,18 +47,18 @@ def test_removing_shellcheck_opts_reverifies(tmp_path):
     proj, home = _proj(tmp_path)
     assert not _hook(proj, home, SHELLCHECK_OPTS="-e SC2086,SC2154").blocked
     r = _hook(proj, home)
-    assert r.blocked and "a.sh" in r.reason, r
+    assert r.blocked and "a.sh" in r.reason and "SC2086" in r.reason, r.reason
 
 
 @needs_shellcheck
 def test_removing_a_parent_directory_shellcheckrc_reverifies(tmp_path):
     proj, home = _proj(tmp_path)
     rc = tmp_path / "outer" / ".shellcheckrc"           # 專案外、專案的上一層
-    rc.write_text(HIDE, encoding="utf-8")
+    rc.write_bytes(HIDE.encode("utf-8"))
     assert not _hook(proj, home).blocked
     rc.unlink()
     r = _hook(proj, home)
-    assert r.blocked and "a.sh" in r.reason, r
+    assert r.blocked and "a.sh" in r.reason and "SC2086" in r.reason, r.reason
 
 
 @needs_shellcheck
@@ -63,11 +66,11 @@ def test_removing_a_parent_directory_shellcheckrc_reverifies(tmp_path):
 def test_removing_a_home_shellcheckrc_reverifies(tmp_path):
     proj, home = _proj(tmp_path)
     rc = home / ".shellcheckrc"
-    rc.write_text(HIDE, encoding="utf-8")
+    rc.write_bytes(HIDE.encode("utf-8"))
     assert not _hook(proj, home).blocked
     rc.unlink()
     r = _hook(proj, home)
-    assert r.blocked and "a.sh" in r.reason, r
+    assert r.blocked and "a.sh" in r.reason and "SC2086" in r.reason, r.reason
 
 
 @needs_shellcheck
@@ -76,11 +79,11 @@ def test_removing_an_xdg_shellcheckrc_reverifies(tmp_path):
     proj, home = _proj(tmp_path)
     (home / ".config").mkdir()
     rc = home / ".config" / "shellcheckrc"
-    rc.write_text(HIDE, encoding="utf-8")
+    rc.write_bytes(HIDE.encode("utf-8"))
     assert not _hook(proj, home).blocked
     rc.unlink()
     r = _hook(proj, home)
-    assert r.blocked and "a.sh" in r.reason, r
+    assert r.blocked and "a.sh" in r.reason and "SC2086" in r.reason, r.reason
 
 
 def test_external_config_is_part_of_the_shell_identity(hook, tmp_path, monkeypatch):
