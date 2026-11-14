@@ -13,10 +13,11 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
-from conftest import FAKE_IMPL, POSIX, pid_alive, run_hook, write
+from conftest import FAKE_IMPL, POSIX, WINDOWS, pid_alive, run_hook, write
 
 posix_only = pytest.mark.skipif(not POSIX, reason="POSIX 專屬:Windows 的 pid_alive 走 OpenProcess,不讀程序狀態檔")
 
@@ -184,3 +185,43 @@ def test_b3_only_python_overrides_get_the_error_handler(hook, tmp_path, monkeypa
     assert hook._override_env(tmp_path / "verify.py")["PYTHONIOENCODING"] == ":backslashreplace"
     monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
     assert hook._override_env(tmp_path / "verify.py") is None
+
+
+# ---------------------------------------------------------------- B1 Windows Job Object 與 kill_leftover_processes
+# 整合層面的兩個方向由既有測試負責,這一輪起在 Windows 上兩個都要綠:
+#   test_stage3_lifecycle::test_l2_old_behaviour_is_kept_behind_a_setting       關掉回收 → 背景程序留著
+#   test_stage3_lifecycle::test_l2_background_process_left_by_a_tool_is_reaped  預設回收 → 背景程序被結束
+# 這裡直接驗 Job Object 本身的行為。
+
+windows_only = pytest.mark.skipif(not WINDOWS, reason="Windows 專屬(在其他平台記為未驗證)")
+SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
+
+
+def _in_job(hook):
+    job = hook._WinJob()
+    proc = subprocess.Popen(SLEEPER, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+    job.assign(proc)
+    return job, proc
+
+
+@windows_only
+def test_b1_closing_a_job_still_ends_what_is_inside(hook):
+    job, proc = _in_job(hook)
+    try:
+        job.close()
+        assert proc.wait(timeout=10) is not None           # KILL_ON_JOB_CLOSE 照舊
+    finally:
+        proc.kill()
+
+
+@windows_only
+def test_b1_a_released_job_leaves_its_processes_running(hook):
+    job, proc = _in_job(hook)
+    try:
+        assert job.release() is True
+        job.close()
+        time.sleep(0.5)
+        assert proc.poll() is None and pid_alive(proc.pid)
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)

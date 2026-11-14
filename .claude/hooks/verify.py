@@ -496,7 +496,7 @@ class _WinJob:
                         ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
                         ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
                         ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
-        self.k32, self.Accounting = k32, Accounting
+        self.k32, self.Accounting, self.Ext = k32, Accounting, Ext
         self.h = k32.CreateJobObjectW(None, None)
         if not self.h:
             raise OSError(ctypes.get_last_error(), "CreateJobObjectW")
@@ -519,6 +519,11 @@ class _WinJob:
 
     def terminate(self):
         self.k32.TerminateJobObject(self.h, 1)
+
+    def release(self):
+        """拿掉 KILL_ON_JOB_CLOSE:之後關閉控制代碼,job 裡還活著的程序不會被一起結束。成功回傳 True。"""
+        info = self.Ext()                                       # LimitFlags = 0:不設任何限制
+        return bool(self.k32.SetInformationJobObject(self.h, 9, self.ct.byref(info), self.ct.sizeof(info)))
 
     def close(self):
         if self.h:
@@ -740,6 +745,11 @@ def run_tool(argv, cwd, timeout, env=None, stdin_bytes=None):
             _watchdog_send(f"-{proc.pid}\n")
         job = getattr(proc, "_verify_job", None)
         if job is not None:
+            # kill_leftover_processes=false:工具留下的背景程序要留著。不先解除 KILL_ON_JOB_CLOSE 的話,
+            # 關閉 job 就會把它們結束(第一次跨平台 CI 實測)。工具還在跑時這個旗標不動:hook 中途死掉,
+            # 工具照樣跟著 job 一起結束。
+            if not _RUN["reap"] and not job.release():
+                warn("無法解除 Job Object 的 KILL_ON_JOB_CLOSE:這次留下的背景程序仍會被結束")
             job.close()
     dur = time.monotonic() - t0
     info["end"] = _end_reason(rc)
