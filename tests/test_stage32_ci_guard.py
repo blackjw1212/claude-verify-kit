@@ -167,6 +167,24 @@ def test_matrix_fails_when_skips_differ_within_one_os(tmp_path):
     assert rc == 1 and "ubuntu-latest 的各個 Python 版本跳過的測試不同" in out and "test_x::t_ok" in out
 
 
+def _pin_ubuntu_38(d):
+    """workflow 把 ubuntu 的 Python 3.8 釘在 ubuntu-24.04(ubuntu-latest 沒有 3.8 的建置;第一次 CI 實測)。"""
+    (d / "junit-ubuntu-latest-py3.8.xml").rename(d / "junit-ubuntu-24.04-py3.8.xml")
+    return d
+
+
+def test_matrix_compares_a_pinned_ubuntu_cell_with_the_other_ubuntu_cells(tmp_path):
+    rc, out = run("matrix", _pin_ubuntu_38(full_matrix(tmp_path / "m")), "--expect-cells", 12)
+    assert rc == 0, out
+    assert "| ubuntu-24.04-py3.8 | 2 | 1 | 0 | 0 | 1 | 0 |" in out          # 表上寫的是實際的映像
+    odd = [("t_ok", "skipped", WIN), ("t_win", "skipped", WIN)]
+    d = _pin_ubuntu_38(full_matrix(tmp_path / "n", {("ubuntu-latest", "3.8"): odd}))
+    rc, out = run("matrix", d, "--expect-cells", 12)
+    # 釘了映像的那一格照樣和其他 ubuntu 格比對:多跳過一條要被抓到,而且訊息說得出是哪幾個映像
+    assert rc == 1 and "ubuntu-24.04、ubuntu-latest 的各個 Python 版本跳過的測試不同" in out, out
+    assert "test_x::t_ok(跳過於:junit-ubuntu-24.04-py3.8)" in out, out
+
+
 def test_matrix_allows_different_skips_across_operating_systems(tmp_path):
     rc, _ = run("matrix", full_matrix(tmp_path / "m"), "--expect-cells", 12)   # Windows 不跳過 t_win、其他跳過
     assert rc == 0

@@ -8,6 +8,7 @@
   junit_summary.py matrix 目錄 [--expect-cells N]
         整個矩陣(檔名 junit-<os>-py<ver>.xml)。有 --expect-cells 時,下列任一項 → exit 1:
         格數不對;各格收集到的測試總數不一致;同一個作業系統的各個 Python 版本跳過的測試不同。
+        「同一個作業系統」看映像名稱的第一段:ubuntu-latest 與 ubuntu-24.04 是同一組。
 
 任何一個檔案讀不到或解析失敗 → exit 1(摘要本身失敗不可以被當成沒事)。
 跳過不等於通過,已知限制(strict xfail)也不等於通過:三者分開計,每一條都列出原因。
@@ -153,6 +154,12 @@ def _os_of(stem):
     return core.rsplit("-py", 1)[0]
 
 
+def _family(image):
+    """ubuntu-latest、ubuntu-24.04 → ubuntu。workflow 只把 ubuntu 的 3.8 釘在 24.04(ubuntu-latest 沒有 3.8),
+    那一格仍要和其他 ubuntu 格比對跳過,不能自成一組而躲過檢查。"""
+    return image.split("-", 1)[0]
+
+
 def matrix(directory, expect_cells=None):
     files = sorted(Path(directory).rglob("junit-*.xml"))
     parsed = OrderedDict((f, parse(f)) for f in files)
@@ -175,8 +182,9 @@ def matrix(directory, expect_cells=None):
         by_os = OrderedDict()
         for f, cases in parsed.items():
             skipped = frozenset(f"{m}::{n}" for m, n, st, _ in cases if st in ("skipped", "xfailed"))
-            by_os.setdefault(_os_of(f.stem), OrderedDict())[f.stem] = skipped
-        for os_name, cells in by_os.items():
+            by_os.setdefault(_family(_os_of(f.stem)), OrderedDict())[f.stem] = skipped
+        for cells in by_os.values():
+            os_name = "、".join(sorted({_os_of(k) for k in cells}))
             sets = list(cells.values())
             if any(s != sets[0] for s in sets[1:]):
                 union = frozenset().union(*sets)

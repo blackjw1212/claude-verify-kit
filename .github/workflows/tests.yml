@@ -49,14 +49,21 @@ jobs:
       - run: actionlint -color
 
   test:
-    name: ${{ matrix.os }} / Python ${{ matrix.python }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.runner || matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ["3.8", "3.11", "3.12", "3.13"]
+        # ubuntu-latest 已是 26.04,setup-python 沒有 3.8 的建置(第一次 CI 實測;版本清單的 3.8 只到 24.04)。
+        # 只把這一格釘在 24.04,其他 ubuntu 格照樣跑最新的映像。檔名與格名用實際的映像,
+        # summary 依映像名稱的第一段(ubuntu)把它和其他 ubuntu 格放在一起比對跳過。
+        include:
+          - os: ubuntu-latest
+            python: "3.8"
+            runner: ubuntu-24.04
     defaults:
       run:
         shell: bash
@@ -93,6 +100,7 @@ jobs:
           exit $missing
       - name: 環境紀錄
         run: |
+          echo "runner 映像:${ImageOS:-?} ${ImageVersion:-?}"
           python -VV
           python -c "import sys, locale; print(sys.platform, 'locale=' + locale.getpreferredencoding(False), 'fs=' + sys.getfilesystemencoding(), 'stdout=' + str(sys.stdout.encoding))"
           node --version
@@ -109,20 +117,20 @@ jobs:
         run: >
           python -m pytest tests -rsxX -p no:cacheprovider
           --basetemp "$RUNNER_TEMP/pytest-tmp"
-          --junitxml "junit-${{ matrix.os }}-py${{ matrix.python }}.xml"
+          --junitxml "junit-${{ matrix.runner || matrix.os }}-py${{ matrix.python }}.xml"
       - name: 結果摘要(通過 / 失敗 / 跳過 / 已知限制與原因)
         if: always()
-        run: python .github/scripts/junit_summary.py cell "junit-${{ matrix.os }}-py${{ matrix.python }}.xml" >> "$GITHUB_STEP_SUMMARY"
+        run: python .github/scripts/junit_summary.py cell "junit-${{ matrix.runner || matrix.os }}-py${{ matrix.python }}.xml" >> "$GITHUB_STEP_SUMMARY"
       - name: 假綠燈檢查(跳過的原因必須是這個平台預期的)
         if: always()
         run: >
           python .github/scripts/junit_summary.py check
-          "junit-${{ matrix.os }}-py${{ matrix.python }}.xml"
+          "junit-${{ matrix.runner || matrix.os }}-py${{ matrix.python }}.xml"
           --os "$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: junit-${{ matrix.os }}-py${{ matrix.python }}
+          name: junit-${{ matrix.runner || matrix.os }}-py${{ matrix.python }}
           path: junit-*.xml
           if-no-files-found: error
 
