@@ -8,11 +8,14 @@ hook 本身的修正(B1 / B2 / B3)與 shellcheck 的已知限制(B4)在檔案後
 
 import builtins
 import errno
+import json
 import os
+import subprocess
+import sys
 
 import pytest
 
-from conftest import POSIX, pid_alive
+from conftest import FAKE_IMPL, POSIX, pid_alive
 
 posix_only = pytest.mark.skipif(not POSIX, reason="POSIX 專屬:Windows 的 pid_alive 走 OpenProcess,不讀程序狀態檔")
 
@@ -46,3 +49,30 @@ def test_a3_other_errors_reading_the_status_are_not_hidden(monkeypatch):
     with pytest.raises(OSError) as e:
         pid_alive(os.getpid())
     assert e.value.errno == errno.EIO
+
+
+# ---------------------------------------------------------------- B6 假工具的紀錄檔
+
+def test_b6_concurrent_fake_tools_never_lose_or_corrupt_log_lines(fake):
+    # 第一次 CI:Windows 上兩個假工具同時附加寫同一份檔案,出現少行(IndexError)與殘行(ValueError)。
+    # 這裡一次開 12 個、讓它們的開始與結束都擠在一起,每一個的 start / end 都必須完整讀得回來。
+    n = 12
+    fake.make("burst", sleep=0.3)
+    cfg = fake.bindir / "burst.fake.json"
+    env = dict(os.environ, FAKE_TOOL_LOG=str(fake.log))
+    procs = [subprocess.Popen([sys.executable, str(FAKE_IMPL), str(cfg)], env=env) for _ in range(n)]
+    assert [p.wait(timeout=60) for p in procs] == [0] * n
+    rows = fake.calls("burst")
+    assert sorted(k for k, _ in rows) == ["end"] * n + ["start"] * n, rows
+    assert fake.runs("burst") == n
+
+
+def test_b6_lines_written_straight_into_the_main_log_are_still_read(fake):
+    # test_stage3_final_realworld 的假 npm 直接往 fake.log 寫一行:合併時不能漏掉主檔
+    fake.log.write_text("npm start 0\n", encoding="utf-8")
+    fake.make("x")
+    cfg = fake.bindir / "x.fake.json"
+    subprocess.run([sys.executable, str(FAKE_IMPL), str(cfg)], env=dict(os.environ, FAKE_TOOL_LOG=str(fake.log)),
+                   check=True)
+    assert fake.runs("npm") == 1 and fake.runs("x") == 1
+    assert json.dumps(fake.calls())  # 每一列都解析得出 (工具, 種類, 時間)

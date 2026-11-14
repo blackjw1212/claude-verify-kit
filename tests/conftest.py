@@ -1,5 +1,6 @@
 """共用的測試工具:在暫存專案裡以子程序執行 Stop hook,模擬 Claude Code 的 stdin。"""
 
+import glob
 import importlib.util
 import json
 import os
@@ -94,6 +95,7 @@ def hook():
 #   POSIX   <name>        sh 腳本:exec python fake_tool.py <name>.fake.json "$@"
 #   Windows <name>.cmd    批次檔:"python" fake_tool.py <name>.fake.json %*   ← 順便走真的 .cmd 執行路徑
 # 每次呼叫把「名稱 start/end 時間」寫進專案外的紀錄檔,測試靠它判斷有沒有跑、跑幾次、是否同時。
+# 每個假工具程序寫自己的一份(主紀錄檔名後面加 .<pid>-<亂數>),calls() 把主檔與它們合併、依時間排序。
 
 WINDOWS = os.name == "nt"
 POSIX = not WINDOWS
@@ -142,10 +144,16 @@ class FakeTools:
             fh.write(comment)
 
     def calls(self, name=None):
-        rows = [ln.split() for ln in self.log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        rows = []
+        for f in [self.log] + sorted(self.log.parent.glob(glob.escape(self.log.name) + ".*")):
+            for ln in f.read_text(encoding="utf-8").splitlines():
+                if ln.strip():
+                    tool, kind, ts = ln.split()
+                    rows.append((float(ts), tool, kind))
+        rows.sort(key=lambda r: r[0])
         out = {}
-        for tool, kind, ts in rows:
-            out.setdefault(tool, []).append((kind, float(ts)))
+        for ts, tool, kind in rows:
+            out.setdefault(tool, []).append((kind, ts))
         return out if name is None else out.get(name, [])
 
     def runs(self, name):
