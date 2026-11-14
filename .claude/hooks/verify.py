@@ -1606,7 +1606,8 @@ def attribute_lines(text, rels, project, per_file=20):
         if cand in wanted:
             lst = by.setdefault(cand, [])
             if len(lst) < per_file:
-                lst.append(clip(ln.rstrip(), 220))
+                # 顯示時位置也用 /(Windows 的工具印反斜線);只換開頭的路徑,訊息本身不動
+                lst.append(clip(cand + ln[m.end(1):].rstrip(), 220))
         else:
             stray += 1
     return by, stray

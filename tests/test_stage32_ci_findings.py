@@ -3,7 +3,8 @@
   A3  pid_alive 讀程序狀態檔途中程序消失 → 丟例外,而不是回答「已死」(ubuntu / Python 3.12)
   B6  兩個假工具同時往同一份紀錄檔附加 → Windows 上行被蓋掉或剩殘片(三條平行測試偶發)
 
-hook 本身的修正(B1 / B2 / B3)與 shellcheck 的已知限制(B4)在檔案後半。
+hook 本身的修正(B2 路徑分隔符號、B3 自訂驗證的輸出、B1 Windows Job Object)在檔案後半;
+shellcheck 的已知限制(B4)在 test_validators_basic.py,與它的 ASCII 對照組放在一起。
 """
 
 import builtins
@@ -76,3 +77,22 @@ def test_b6_lines_written_straight_into_the_main_log_are_still_read(fake):
                    check=True)
     assert fake.runs("npm") == 1 and fake.runs("x") == 1
     assert json.dumps(fake.calls())  # 每一列都解析得出 (工具, 種類, 時間)
+
+
+# ---------------------------------------------------------------- B2 逐檔工具輸出的路徑分隔符號
+
+def test_b2_attributed_lines_are_shown_with_forward_slashes(hook, tmp_path):
+    # Windows 上 Python 語法檢查與 shellcheck 印的是 .claude\hooks\gate.py:1:10: …(第一次 CI 實測);
+    # 歸屬一直是對的(比對前就換成 /),但顯示出來的那一行原樣保留了反斜線。
+    text = ".claude\\hooks\\gate.py:1:10: SyntaxError: invalid syntax\n"
+    by, stray = hook.attribute_lines(text, [".claude/hooks/gate.py"], tmp_path / "proj")
+    assert by == {".claude/hooks/gate.py": [".claude/hooks/gate.py:1:10: SyntaxError: invalid syntax"]}
+    assert stray == 0
+
+
+def test_b2_only_the_location_prefix_is_rewritten(hook, tmp_path):
+    # 訊息本身的反斜線(Windows 路徑、跳脫字元)不能被改掉
+    text = "腳本 們\\部署.sh:2:6: note: see C:\\tools\\x and '\\n' [SC2086]\nother line\n"
+    by, stray = hook.attribute_lines(text, ["腳本 們/部署.sh"], tmp_path / "proj")
+    assert by == {"腳本 們/部署.sh": ["腳本 們/部署.sh:2:6: note: see C:\\tools\\x and '\\n' [SC2086]"]}
+    assert stray == 1
