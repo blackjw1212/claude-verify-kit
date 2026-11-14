@@ -76,6 +76,16 @@ def test_readme_names_the_runner_the_python38_cell_is_pinned_to():
     assert "runner: ubuntu-24.04" in WORKFLOW and "固定在 `ubuntu-24.04`" in README
 
 
+def test_readme_states_the_b4_condition_the_test_uses():
+    src = (ROOT / "tests" / "test_validators_basic.py").read_text(encoding="utf-8")
+    assert "_acp_cannot_encode(CJK_DIR + \"\\\\\" + CJK_SCRIPT, _windows_acp())" in src
+    assert "WC_NO_BEST_FIT_CHARS = 0x400" in src
+    bullet = next(ln for ln in README.splitlines() if "hPutChar" in ln)
+    for word in ("`GetACP()`", "無法無損編碼", "best-fit", "`WideCharToMultiByte`", "推定", "沒有查證", "沒有根治",
+                 "`hPutChar: invalid argument (invalid character)`", "其他錯誤一律算失敗", "SC2086"):
+        assert word in bullet, word
+
+
 @pytest.mark.parametrize("stale", [
     "POSIX 的 ctime 在寫入時一定更新",                       # Stage 3.1 推翻的假設
     "超過就不讀內容,只比 stat(大小、mtime、ctime、inode)",   # BIG_FILE 的舊註解:預設 false 之後大檔也讀內容
@@ -83,6 +93,7 @@ def test_readme_names_the_runner_the_python38_cell_is_pinned_to():
     "到目前為止一次都還沒有執行過",                          # 第一次跨平台 CI 之前的 README
     "尚未執行過任何一次",
     "（尚未執行的）CI 測試",
+    "三個碼頁都編不出",                                      # B4 第二輪的條件 1:第三輪 CI 推翻
 ])
 def test_statements_the_audit_found_stale_do_not_come_back(stale):
     assert stale not in HOOK_SRC
