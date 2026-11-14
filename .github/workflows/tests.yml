@@ -94,7 +94,7 @@ jobs:
           done
           if [ "$RUNNER_OS" != "Windows" ]; then
             # 與 test_python_interpreter_switch_reverifies 找第二個直譯器的方式相同
-            python -c "import os, shutil, sys; o = [p for p in (shutil.which('python3.11'), shutil.which('python3.12'), shutil.which('python3')) if p and os.path.realpath(p) != os.path.realpath(sys.executable)]; print('第二個 Python:', o[:1]); sys.exit(0 if o else 1)" \
+            python -c "import os, shutil, sys; o = [p for p in (shutil.which('python3.11'), shutil.which('python3.12'), shutil.which('python3')) if p and os.path.realpath(p) != os.path.realpath(sys.executable)]; print('second python:', o[:1]); sys.exit(0 if o else 1)" \
               || { echo "::error::找不到第二個 Python 直譯器"; missing=1; }
           fi
           exit $missing
@@ -105,7 +105,7 @@ jobs:
           python -c "import sys, locale; print(sys.platform, 'locale=' + locale.getpreferredencoding(False), 'fs=' + sys.getfilesystemencoding(), 'stdout=' + str(sys.stdout.encoding))"
           if [ "$RUNNER_OS" = Windows ]; then
             # 第一次 CI:碼頁編不出路徑時 shellcheck 崩潰;它用哪一個碼頁沒有確認,四個都記下來
-            python -c "import ctypes; k = ctypes.windll.kernel32; print('碼頁:ACP', k.GetACP(), 'OEMCP', k.GetOEMCP(), 'ConsoleCP', k.GetConsoleCP(), 'ConsoleOutputCP', k.GetConsoleOutputCP())"
+            python -c "import ctypes; k = ctypes.windll.kernel32; print('codepages: ACP', k.GetACP(), 'OEMCP', k.GetOEMCP(), 'ConsoleCP', k.GetConsoleCP(), 'ConsoleOutputCP', k.GetConsoleOutputCP())"
           fi
           node --version
           npm --version
