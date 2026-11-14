@@ -190,6 +190,9 @@ def pid_alive(pid):
         return True
     status = f"/proc/{pid}/status"
     if os.path.exists(status):
-        with open(status, encoding="utf-8") as fh:
-            return not any(ln.startswith("State:") and "Z" in ln.split()[1] for ln in fh)
+        try:
+            with open(status, encoding="utf-8") as fh:
+                return not any(ln.startswith("State:") and "Z" in ln.split()[1] for ln in fh)
+        except (ProcessLookupError, FileNotFoundError):
+            return False        # 檢查之後、讀完之前程序消失了(第一次 CI 實測:讀到一半 ESRCH)
     return True
