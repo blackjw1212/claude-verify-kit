@@ -89,7 +89,7 @@ def test_paths_with_spaces_and_cjk(tmp_path):
 # 寫到輸出時自己崩潰(hPutChar: invalid argument (invalid character)),四格都一樣。hook 有擋下,
 # 但訊息不是 shellcheck 的檢查結果。這是外部工具在那種碼頁下的限制,只在下面三個條件同時成立時
 # 才算「已知限制」(strict xfail,raises 限定那一個例外):
-#   1. Windows,而且 ANSI / OEM / 主控台輸出三個碼頁都編不出這個測試路徑
+#   1. Windows,而且 ANSI / OEM / 主控台輸入 / 主控台輸出四個碼頁(非 0 的)都編不出這個測試路徑
 #   2. 擋下的原因是 shellcheck,而且是那一句 hPutChar 錯誤、沒有任何 SC 檢查結果
 #   3. 其他失敗(別的 shellcheck 錯誤、hook 錯誤、沒有擋下)照樣是失敗
 # 測試因故通過 → XPASS(strict) → 失敗,提醒把這個標記拿掉。ASCII 路徑的對照組在每個平台都必須報出 SC2086。
@@ -99,14 +99,22 @@ SHELLCHECK_HPUTCHAR = "hPutChar: invalid argument (invalid character)"
 SCRIPT_WITH_SC2086 = b"#!/bin/sh\necho $1\n"      # 位元組:Windows 的文字模式會寫成 CRLF(見 B5)
 
 
-def _windows_codepages():
-    """ANSI、OEM、主控台輸出碼頁對應的 Python 編解碼器名稱;有一個不認得就回 None(證明不了「編不出」)。"""
+def _windows_codepage_numbers():
+    """{角色: 碼頁}。shellcheck(GHC)實際用哪一個沒有確認,所以四個都列:ANSI、OEM、主控台輸入、主控台輸出。
+    沒有主控台時後兩個是 0。"""
     import ctypes  # noqa: PLC0415
     k32 = ctypes.windll.kernel32
+    return {"ACP": k32.GetACP(), "OEMCP": k32.GetOEMCP(),
+            "ConsoleCP": k32.GetConsoleCP(), "ConsoleOutputCP": k32.GetConsoleOutputCP()}
+
+
+def _windows_codepages():
+    """上面每一個非 0 碼頁對應的 Python 編解碼器名稱;有一個不認得就回 None(證明不了「編不出」)。
+    條件是「全部都編不出」:多列一個候選只會讓已知限制更難成立,不會更寬。"""
     names = []
-    for cp in {k32.GetACP(), k32.GetOEMCP(), k32.GetConsoleOutputCP()}:
+    for cp in sorted(set(_windows_codepage_numbers().values())):
         if not cp:
-            continue                                 # 沒有主控台時是 0
+            continue
         try:
             names.append(codecs.lookup(f"cp{cp}").name)
         except LookupError:
@@ -144,7 +152,7 @@ def _shellcheck_diag(r, script):
     """完整的診斷:hook 的整段原因、hook 的原始輸出,以及直接跑一次 shellcheck 的原始位元組(不經過 hook 的摘要)。"""
     sc = shutil.which("shellcheck")
     direct = subprocess.run([sc, "-f", "gcc", str(script)], cwd=str(script.parent), capture_output=True) if sc else None
-    parts = [f"碼頁:{_windows_codepages() if WINDOWS else '(非 Windows)'};"
+    parts = [f"碼頁:{_windows_codepage_numbers() if WINDOWS else '(非 Windows)'} → {_windows_codepages() if WINDOWS else ''};"
              f"已知限制條件 1:{CODEPAGE_CANNOT_ENCODE_CJK_PATH}",
              "--- hook 的原因(完整)", r.reason, "--- hook 的原始 stdout", r.stdout, "--- hook 的 stderr", r.stderr]
     if direct is not None:

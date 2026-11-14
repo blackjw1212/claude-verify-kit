@@ -103,6 +103,10 @@ jobs:
           echo "runner 映像:${ImageOS:-?} ${ImageVersion:-?}"
           python -VV
           python -c "import sys, locale; print(sys.platform, 'locale=' + locale.getpreferredencoding(False), 'fs=' + sys.getfilesystemencoding(), 'stdout=' + str(sys.stdout.encoding))"
+          if [ "$RUNNER_OS" = Windows ]; then
+            # 第一次 CI:碼頁編不出路徑時 shellcheck 崩潰;它用哪一個碼頁沒有確認,四個都記下來
+            python -c "import ctypes; k = ctypes.windll.kernel32; print('碼頁:ACP', k.GetACP(), 'OEMCP', k.GetOEMCP(), 'ConsoleCP', k.GetConsoleCP(), 'ConsoleOutputCP', k.GetConsoleOutputCP())"
+          fi
           node --version
           npm --version
           shellcheck --version | sed -n 2p
