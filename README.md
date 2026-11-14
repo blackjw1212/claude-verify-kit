@@ -70,6 +70,8 @@
 
 舊版（Stage 1–3）固定是 `replace`：放一份 `verify.sh` 之後，JSON、Python 語法、hook 設定等內建檢查就全部停了——例如 `.claude/hooks/*.py` 有語法錯誤也會放行。不認得的設定值一律當成 `augment`。
 
+`.py` 的自訂驗證：環境裡沒有設 `PYTHONIOENCODING`（或設成空字串）時，以 `PYTHONIOENCODING=:backslashreplace` 執行——輸出編碼照系統預設，只是編碼不出的字改印成 `\uXXXX`，不會因為 `UnicodeEncodeError` 而失敗。Windows 上輸出導向管線時用的是系統碼頁（GitHub 的 Windows runner 是 cp1252），印中文就會出錯（第一次跨平台 CI 實測）。自己設了 `PYTHONIOENCODING` 就照你的設定；`.sh`、`.cmd` 等其他形式不受影響。
+
 ## 逃生口
 
 硬體專屬或半成品狀態要讓 Claude 正常收尾：
@@ -114,11 +116,12 @@ Stop hook 從 stdin 讀事件 JSON，失敗時回 `{"decision":"block","reason":
   - 任何檔案被刪除時，`precise` 模式也重建。
 - **自訂驗證 `.claude/verify*`**：預設每次都跑（`override_cache: false`），因為它讀什麼、依賴什麼無從得知。設成 `true` 會把常見工具、相依目錄、工具鏈與**整份環境變數**（`CC`、`CFLAGS` 之類都算；只存雜湊，值不落地）算進環境，沒變就不重跑。有自訂驗證時，內建檢查預設照跑（`custom_verify_mode: "augment"`，見「自訂驗證標準」）。
 - **快取本身的安全**：快取檔有 SHA-256 校驗碼，並記錄所在目錄、格式版本（目前 2）、kit 版本、設定雜湊。任一項不符（截斷、寫壞、欄位型別錯、手改、從別的目錄複製來）→ 整份作廢、完整驗證。全綠紀錄和快取存在同一個檔、同一次原子寫入，所以刪掉或寫壞快取，就不會走快速路徑。狀態檔的欄位型別也會檢查。hook 若仍在第一次執行時崩潰，會改用「不含快取」的完整驗證重試；兩次都失敗才放行，而且使用者看得到。**信任邊界**：校驗碼擋不住「改完連校驗碼一起重算」的刻意竄改（實測過：重算後的偽造快取會被接受），因為 hook 與被它管的程序權限相同——能這樣做的人也能改 `verify.json` 或建立 `skip-verify`。要防模型自己動這些檔，請在專案的 `.claude/settings.json` 加拒絕規則（見下方「保護驗證設定」）。
-- **並行與終止**：多個 hook 同時跑時，快取用原子替換寫入（Windows 上目標檔被別的程序開著時會短暫重試）；結果以內容雜湊為鍵，舊的寫入不會套到不同的內容上。hook 不論怎麼結束都不留孤兒程序：SIGTERM／SIGINT 由訊號處理器收掉整棵子程序樹；SIGKILL（包括整個程序群組被 SIGKILL）由外部看門程序收掉（POSIX）、由 Job Object 收掉（Windows）。hook 的父程序（Claude Code）死掉時，hook 會停掉工具、不寫快取、直接結束。工具正常結束後留下的背景程序也會被收掉（`kill_leftover_processes: false` 可關）。被終止的那一次一定不會寫入快取。**實測範圍**：以上在 Linux 上實測；Windows 的 Job Object 與檔案被鎖時的重試只有程式與（尚未執行的）CI 測試，**未在 Windows 實機驗證**；macOS 未實測。自己用 `setsid` 之類脫離程序群組的程序收不到。
+- **並行與終止**：多個 hook 同時跑時，快取用原子替換寫入（Windows 上目標檔被別的程序開著時會短暫重試）；結果以內容雜湊為鍵，舊的寫入不會套到不同的內容上。hook 不論怎麼結束都不留孤兒程序：SIGTERM／SIGINT 由訊號處理器收掉整棵子程序樹；SIGKILL（包括整個程序群組被 SIGKILL）由外部看門程序收掉（POSIX）、由 Job Object 收掉（Windows）。hook 的父程序（Claude Code）死掉時，hook 會停掉工具、不寫快取、直接結束。工具正常結束後留下的背景程序也會被收掉（`kill_leftover_processes: false` 可關）。被終止的那一次一定不會寫入快取。**實測範圍**：以上在 Linux 上實測。Windows：第一次跨平台 CI（2026-11-12，GitHub Actions 的 Windows runner）上，「hook 被終止時 Job Object 收掉工具」與「預設收掉留下的背景程序」的測試通過；`kill_leftover_processes: false` 當時**沒有作用**（關閉 job 時背景程序被一起結束），之後已修正，修正後的行為要看下一輪 CI。檔案被鎖時的重試只有程式與測試。以上都不是在使用者自己的 Windows／macOS 機器上實測。自己用 `setsid` 之類脫離程序群組的程序收不到。
 - **平行**：彼此獨立的驗證器同時跑，最多 `max_parallel` 個，其中重型最多 `max_heavy` 個（預設 1）。
 - **已知限制**：
   - 內容改了但大小與 mtime 都被還原（`touch -r`、`cp -p`、tar 解壓、`robocopy`）：預設的 `trust_mtime: false` 每次重算 SHA-256，所以擋得下，不靠任何時間戳記。Linux 上在 ext4、xfs、btrfs、tmpfs、overlay，以及 ntfs-3g、fusefat（FAT32）、exfat-fuse（exFAT）三個 FUSE 實作上實測。明確設 `"auto"` 時 Linux／macOS 改靠 ctime：**在 FAT32 與 exFAT 的 FUSE 實作上會漏判**（ctime 恆等於 mtime）。明確設 `true` 時 Windows 上也會漏判。見下方「trust_mtime 的安全取捨」。
   - 被略過的目錄（`dist/`、`build/`、`.cache/`…）裡的檔案，只有被建置設定明確引用時才會追蹤；測試若讀取那些目錄，請設 `"cache": false`。
+  - Windows 上 `.sh` 檔的路徑含有系統碼頁編不出的字（例如 cp1252 下的中文路徑）時，shellcheck 自己在寫輸出時崩潰（shellcheck 0.9.0：`hPutChar: invalid argument (invalid character)`）。hook 照樣擋下，但訊息不是 shellcheck 的檢查結果。第一次跨平台 CI 在 Windows runner 上實測到；這是外部工具的限制，測試以 strict xfail 記錄，而且只在「Windows、三個碼頁都編不出、而且就是那一句錯誤」時才算，ASCII 路徑的對照組在每個平台都必須報出 SC2086。
   - 工具執行檔只看 stat、不讀內容，也不受 `trust_mtime` 影響；工具鏈目錄清單（PlatformIO 的 `packages/`、rustup 的 toolchains…）裡的子目錄也只看 stat。相依目錄與專案外的小設定檔預設讀內容（見上）。
 - **相關設定**（`.claude/verify.json`）：`max_parallel`、`max_heavy`、`cache`、`override_cache`、`custom_verify_mode`（`"augment"`／`"replace"`）、`trust_mtime`（預設 `false`；`"auto"`／`true`）、`dep_scan_cap`、`kill_leftover_processes`、`debug`（或環境變數 `CLAUDE_VERIFY_DEBUG=1`）。紀錄檔 `.claude/.verify.log` 的每個工具結果會寫 `pid`、耗時、結束原因（`exit`／`signal N`／`timeout_killed`）。
 - **效能**：`python3 bench/benchmark.py`。下面第一張表是 Stage 1–2 當時各自量的歷史紀錄（**不含 Stage 3 之後的版本**）；目前這一版的數字在第二張表。
@@ -218,9 +221,9 @@ FAT32／exFAT 的結果只來自兩個 FUSE 實作（fusefat、exfat-fuse），*
 
 | 平台 | 狀態 |
 |---|---|
-| Linux（x86_64，Python 3.8／3.11／3.12／3.13） | 實測通過 |
-| Windows | **未實測**。CI 矩陣已就緒（`.github/workflows/tests.yml`），**尚未執行過任何一次**；Job Object、`.cmd` 執行、重算 SHA-256 等 Windows 路徑都沒有在實機跑過 |
-| macOS | **未實測**。程式碼走 POSIX 路徑，但沒有 `/proc`（判斷留下的背景程序時殭屍也算成員） |
+| Linux（x86_64，Python 3.8／3.11／3.12／3.13） | 實測通過。第一次跨平台 CI（2026-11-12，run 43137519055）的 ubuntu 格：3.11／3.12／3.13 的失敗都是測試本身的假設或競態（已修正）；3.8 那格因為 `ubuntu-latest`（26.04）沒有 Python 3.8 而沒有執行，之後只有那一格改用 `ubuntu-24.04` |
+| Windows | **只在 CI 上跑過**（同一次，GitHub Actions 的 Windows runner）：4 格都有 8–10 條失敗——`kill_leftover_processes: false` 沒有作用、輸出路徑的反斜線、`.py` 自訂驗證印中文就失敗、shellcheck 在 cp1252 下遇到中文路徑崩潰，以及兩項測試本身的問題。前三項與測試本身的兩項已修正，shellcheck 那一項列為已知限制，修正後的結果要看下一輪 CI。安裝流程與 Windows 工具鏈未實測 |
+| macOS | **只在 CI 上跑過**（同一次，GitHub Actions 的 macOS runner）：4 格全部通過（401 條中 343 通過、58 條依平台跳過）。實機與工具鏈未實測。程式碼走 POSIX 路徑，但沒有 `/proc`（判斷留下的背景程序時殭屍也算成員） |
 | 檔案系統 | 只在 Linux 上實測：ext4、xfs、btrfs、tmpfs、overlay，以及 FUSE 的 ntfs-3g、fusefat（FAT32）、exfat-fuse（exFAT）。預設 `false` 在這 8 種上全部擋得下；明確設 `"auto"` 時 FAT32 與 exFAT 會漏判。`tests/test_stage32_fs_semantics.py` + `.github/scripts/mount_test_filesystems.py` |
 
 ### 工具鏈實際驗證範圍
@@ -255,14 +258,14 @@ FAT32／exFAT 的結果只來自兩個 FUSE 實作（fusefat、exfat-fuse），*
 
 ## 跨平台 CI 與驗收工具
 
-- **CI**：`.github/workflows/tests.yml`，Ubuntu／Windows／macOS × Python 3.8／3.11／3.12／3.13，`fail-fast: false`。**到目前為止一次都還沒有執行過**（沒有 push）。綠燈的意思是「該跑的都跑了而且通過」，不只是「沒有測試失敗」：
+- **CI**：`.github/workflows/tests.yml`，Ubuntu／Windows／macOS × Python 3.8／3.11／3.12／3.13，`fail-fast: false`。Ubuntu 的 Python 3.8 那一格固定在 `ubuntu-24.04`（`ubuntu-latest` 已是 26.04，setup-python 沒有 3.8 的建置），其他格用各平台的 `-latest`。第一次執行在 2026-11-12（run 43137519055）：16 個 job 中 7 綠 9 紅，原因與處置見上面的平台表；之後的結果以 Actions 頁面為準。綠燈的意思是「該跑的都跑了而且通過」，不只是「沒有測試失敗」：
   - 必要工具（shellcheck、node、npm；POSIX 另要第二個 Python）在測試之前檢查，缺了就在那一步紅——安裝失敗不會變成測試跳過。
   - 每格的「假綠燈檢查」（`.github/scripts/junit_summary.py check`）：跳過的原因必須是這個平台預期的。Linux 只能跳過 Windows 專屬；macOS 另可跳過 Linux 專屬（`/proc`）；Windows 可跳過 POSIX 與 Linux 專屬；三者都可跳過「需要測試用檔案系統掛載」。其他原因（工具沒裝…）一律紅。已知限制以 strict xfail 記錄，單獨計數、不算通過。
-  - `summary`：12 格齊全、每格收集到的測試數相同、同一作業系統的各 Python 版本跳過的測試相同、所有上游 job 都成功。摘要腳本讀不到或解析失敗也算紅。
+  - `summary`：12 格齊全、每格收集到的測試數相同、同一作業系統的各 Python 版本跳過的測試相同（依映像名稱的第一段分組：`ubuntu-24.04` 與 `ubuntu-latest` 是同一組）、所有上游 job 都成功。摘要腳本讀不到或解析失敗也算紅。
   - `fs-semantics`：在 Linux 上掛 8 種真的檔案系統跑 `tests/test_stage32_fs_semantics.py`，不允許任何跳過。
   - `workflow-lint`（actionlint）與 `py38-compat`（vermin）。
   - pytest 版本鎖在 `.github/ci-requirements.txt`：Python 3.10 以上用 9.2.0（含 CVE-2025-71176 的修正）；3.8 用 8.3.5——最後一個支援 3.8 的版本，**沒有那個修正，也不會再有新版**，所以每格都以 `--basetemp` 指到 job 專屬目錄，不使用 `/tmp/pytest-of-<user>`。
-  假工具是 Python 實作、依平台產生 sh 或 `.cmd` 啟動器，所以絕大多數測試在 Windows 上也會跑，而且走的是真的 `.cmd` 執行路徑。以上這些防線本身在 Linux 上以合成的 JUnit 與逐步重放 workflow 驗證過；在 GitHub 的 runner 上會不會照預期運作，要第一次執行才知道。
+  假工具是 Python 實作、依平台產生 sh 或 `.cmd` 啟動器，所以絕大多數測試在 Windows 上也會跑，而且走的是真的 `.cmd` 執行路徑。以上這些防線本身在 Linux 上以合成的 JUnit 與逐步重放 workflow 驗證過。第一次在 GitHub 的 runner 上執行時照設計運作：9 個紅 job 沒有一個被摘要當成綠；其餘 11 格的必要工具都裝得起來，POSIX 格都找得到第二個 Python；8 種掛載在 runner 上都成功。
 - **真實工具鏈**：`python3 bench/real_toolchains.py --work DIR`。在隔離目錄用真的 pip／npm／cargo／rustup／cmake／gcc／clang／shellcheck／PlatformIO／ESP-IDF 建置，逐步記錄裁決、是否真的重跑、驗證器結果與原因摘錄。需要網路，不進 CI。
 - **真實專案**：`python3 bench/real_projects.py --work DIR --src DIR --site PATH`。一律在隔離副本上做，原始目錄不寫入。
 - **效能**：`python3 bench/stage3_perf.py --revs 2f94628,WORKTREE --repeat 20`（5 萬專案檔＋4 萬 node_modules；中位數／P95、CPU、峰值記憶體、子程序數、快取大小）。

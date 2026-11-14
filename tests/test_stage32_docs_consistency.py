@@ -66,10 +66,23 @@ def test_filesystems_listed_in_readme_are_the_ones_the_tests_mount():
     assert f"這 {len(labels)} 種" in row
 
 
+def test_readme_describes_how_python_overrides_are_run(hook, tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    value = hook._override_env(tmp_path / "verify.py")["PYTHONIOENCODING"]
+    assert f"`PYTHONIOENCODING={value}`" in README
+
+
+def test_readme_names_the_runner_the_python38_cell_is_pinned_to():
+    assert "runner: ubuntu-24.04" in WORKFLOW and "固定在 `ubuntu-24.04`" in README
+
+
 @pytest.mark.parametrize("stale", [
     "POSIX 的 ctime 在寫入時一定更新",                       # Stage 3.1 推翻的假設
     "超過就不讀內容,只比 stat(大小、mtime、ctime、inode)",   # BIG_FILE 的舊註解:預設 false 之後大檔也讀內容
     "→ 只跑它,exit code 即裁決",                            # 模組說明的舊優先序:augment 之後內建檢查照跑
+    "到目前為止一次都還沒有執行過",                          # 第一次跨平台 CI 之前的 README
+    "尚未執行過任何一次",
+    "（尚未執行的）CI 測試",
 ])
 def test_statements_the_audit_found_stale_do_not_come_back(stale):
     assert stale not in HOOK_SRC
