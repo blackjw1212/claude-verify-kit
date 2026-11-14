@@ -163,8 +163,10 @@ def _wide_char_to_multibyte(text, cp, flags):
 
 
 def _winapi_lossless(text, cp):
-    """Windows 自己的轉換,不接受 best-fit:True = 沒用替代字元;False = 用了;None = 問不到。
-    UTF-8(65001)等碼頁不接受這組參數,呼叫失敗 → None。"""
+    """Windows 自己的轉換,不接受 best-fit:True = 沒用替代字元;False = 用了;None = 問不到(無法判定,不是成功)。
+    65001(UTF-8):第四輪 CI(run 43558526995,runner 映像 win25-vs2026 20261103.298.1)實測這組參數呼叫成功、
+    回 True。Microsoft 文件的描述是 CP_UTF8 時 dwFlags 只能是 0 或 WC_ERR_INVALID_CHARS、lpUsedDefaultChar
+    必須是 NULL,否則呼叫失敗(那樣會回 None)。實測與文件不一致,原因尚未查明;兩種結果都不可以是 False。"""
     r = _wide_char_to_multibyte(text, cp, WC_NO_BEST_FIT_CHARS)
     return None if r is None else not r[1]
 
@@ -241,7 +243,7 @@ def test_condition_1_reads_the_ansi_code_page_not_the_console_one():
     (950, False, False),     # ACP 能表示這個路徑(繁中 Windows)→ 不套用,即使另一邊說編不出
     (950, True, False),
     (936, True, False),
-    (65001, None, False),    # ACP 是 UTF-8:API 不接受不用 best-fit 的參數(None)、Python 編得出 → 不套用
+    (65001, None, False),    # ACP 是 UTF-8、API 無法判定(None;第四輪 CI 實測是 True,見 _winapi_lossless)、Python 編得出 → 不套用
     (99999, False, False),   # 不認得的碼頁 → 不套用
     (0, False, False),
 ], ids=["cp1252-both-cannot", "cp1252-winapi-can", "cp1252-winapi-unknown", "cp950-winapi-cannot",
@@ -266,7 +268,11 @@ def test_winapi_check_rejects_best_fit_substitutes():
     assert _winapi_lossless("ā", 1252) is False
     # 沒有 WC_NO_BEST_FIT_CHARS 時 Windows 把 ā 換成 a,而且不算用了替代字元:只看替代字元旗標會被騙
     assert _wide_char_to_multibyte("ā", 1252, 0) == (b"a", False)
-    assert _winapi_lossless(CJK_REL_PATH, 65001) is None    # UTF-8 不接受這組參數:問不到,不是「編不出」
+    # 65001:第四輪 CI 實測回 True,Microsoft 文件描述的是呼叫失敗(None);不一致的原因尚未查明。
+    # True = 可以無損轉換、None = 無法判定(不是成功);False(明確判定編不出)必須讓測試失敗。
+    assert _winapi_lossless(CJK_REL_PATH, 65001) in (True, None)
+    # 最終分類:ACP 是 UTF-8 時,中文路徑不得被算成已知限制
+    assert _acp_cannot_encode(CJK_REL_PATH, 65001) is False
 
 
 @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck 未安裝")
