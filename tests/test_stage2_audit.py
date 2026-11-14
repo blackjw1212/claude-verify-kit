@@ -600,6 +600,24 @@ def test_crash_on_first_attempt_retries_without_cache(hook, project, monkeypatch
     assert "完整驗證" in out.get("systemMessage", "")
 
 
+def _path_without(tool, dirs, scratch):
+    """PATH 目錄清單,但找不到 tool:含有 tool 的目錄換成「其他檔案都連回原處」的鏡像目錄。
+    CI 的 ubuntu runner 把 shellcheck 和 sh、git 一起放在 /usr/bin(第一次 CI 實測),
+    整個拿掉 /usr/bin 會連其他工具一起拿掉。"""
+    out = []
+    for i, d in enumerate(dirs):
+        if shutil.which(tool, path=d) is None:
+            out.append(d)
+            continue
+        mirror = scratch / f"path-without-{tool}-{i}"
+        mirror.mkdir()
+        for entry in os.scandir(d):
+            if os.path.splitext(entry.name)[0].lower() != tool:
+                (mirror / entry.name).symlink_to(entry.path)
+        out.append(str(mirror))
+    return out
+
+
 def test_installing_a_missing_tool_counts_as_a_change_for_the_loop_guard(project, fake, tmp_path):
     # Stage 1 遺留疑點:Claude 只是補裝工具、沒改專案檔 → 舊版防迴圈當成「沒變」直接放行。
     write(project, "a.sh", "#!/bin/sh\necho ok\n")
@@ -609,6 +627,7 @@ def test_installing_a_missing_tool_counts_as_a_change_for_the_loop_guard(project
         dirs.append(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"))
     else:
         dirs += ["/usr/bin", "/bin"]
+    dirs = _path_without("shellcheck", dirs, tmp_path)
     env = dict(fake.env, PATH=os.pathsep.join(dirs))  # 確定沒有真的 shellcheck
     assert shutil.which("shellcheck", path=env["PATH"]) is None
     first = run_hook(project, {"session_id": "s1", "stop_hook_active": False}, env=env)
