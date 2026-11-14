@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from conftest import FAKE_IMPL, POSIX, pid_alive
+from conftest import FAKE_IMPL, POSIX, pid_alive, run_hook, write
 
 posix_only = pytest.mark.skipif(not POSIX, reason="POSIX 專屬:Windows 的 pid_alive 走 OpenProcess,不讀程序狀態檔")
 
@@ -96,3 +96,91 @@ def test_b2_only_the_location_prefix_is_rewritten(hook, tmp_path):
     by, stray = hook.attribute_lines(text, ["腳本 們/部署.sh"], tmp_path / "proj")
     assert by == {"腳本 們/部署.sh": ["腳本 們/部署.sh:2:6: note: see C:\\tools\\x and '\\n' [SC2086]"]}
     assert stray == 1
+
+
+# ---------------------------------------------------------------- B3 自訂驗證印出碼頁編不出的字
+
+UNENCODABLE = "標記 😀"     # 只有 UTF 系列編得出來:cp1252、cp950、ASCII 都不行
+
+
+def _narrow_output_env():
+    """讓子程序的 stdout / stderr 用「編不出 UNENCODABLE」的編碼,而且不靠 PYTHONIOENCODING(那是要測的東西)。
+    POSIX:C locale + 關掉 UTF-8 模式與 locale 強制轉換 → ASCII。Windows:系統碼頁本身(CI 的 runner 是 cp1252)。"""
+    env = {"PYTHONIOENCODING": "", "PYTHONUTF8": "0"}
+    if POSIX:
+        env.update(LC_ALL="C", LANG="C", LC_CTYPE="C", PYTHONCOERCECLOCALE="0")
+    return env
+
+
+def _probe_stdio(env):
+    """同樣的環境下,一支普通的 Python 程式(輸出導向管線)拿到的 stdout / stderr 編碼與錯誤處理。"""
+    code = ("import sys, json; print(json.dumps([sys.stdout.encoding, sys.stdout.errors, "
+            "sys.stderr.encoding, sys.stderr.errors]))")
+    out = subprocess.run([sys.executable, "-c", code], env=dict(os.environ, **env), capture_output=True, check=True)
+    return json.loads(out.stdout.decode("ascii"))
+
+
+def _assert_narrow(env):
+    enc, errs, _, _ = _probe_stdio(env)
+    try:
+        UNENCODABLE.encode(enc)
+    except UnicodeEncodeError:
+        return enc, errs
+    raise AssertionError(f"前提不成立:這個環境的輸出編碼 {enc} 編得出測試字串,測不到 B3")
+
+
+STDIO_SCRIPT = """
+import json, os, sys
+open({mark!r}, "w", encoding="utf-8").write(json.dumps({{
+    "env": os.environ.get("PYTHONIOENCODING"),
+    "stdout": [sys.stdout.encoding, sys.stdout.errors], "stderr": [sys.stderr.encoding, sys.stderr.errors]}}))
+print("out:" + {text!r})
+print("err:" + {text!r}, file=sys.stderr)
+sys.stdout.flush()
+sys.stderr.flush()
+sys.exit({rc})
+"""
+
+
+def test_b3_override_printing_unencodable_text_does_not_crash(project, tmp_path):
+    env = _narrow_output_env()
+    enc, errs = _assert_narrow(env)
+    assert errs != "backslashreplace"                     # 不修正的話 stdout 是 strict / surrogateescape
+    mark = tmp_path / "stdio.json"
+    write(project, ".claude/verify.py", STDIO_SCRIPT.format(mark=str(mark), text=UNENCODABLE, rc=0))
+    r = run_hook(project, env=env)
+    assert not r.blocked, r.reason
+    seen = json.loads(mark.read_text(encoding="utf-8"))
+    assert seen["stdout"] == [enc, "backslashreplace"]    # 編碼照舊,只換錯誤處理
+    assert seen["stderr"] == [enc, "backslashreplace"]
+
+
+def test_b3_escaped_text_from_stdout_and_stderr_reaches_the_reason(project, tmp_path):
+    env = _narrow_output_env()
+    _assert_narrow(env)
+    write(project, ".claude/verify.py", STDIO_SCRIPT.format(mark=str(tmp_path / "m.json"), text=UNENCODABLE, rc=1))
+    r = run_hook(project, env=env)
+    assert r.blocked
+    esc = UNENCODABLE.encode("ascii", "backslashreplace").decode("ascii")
+    assert "out:" + esc in r.reason and "err:" + esc in r.reason, r.reason
+    assert "UnicodeEncodeError" not in r.reason, r.reason
+
+
+def test_b3_a_pythonioencoding_set_by_the_user_is_left_alone(project, tmp_path):
+    env = dict(_narrow_output_env(), PYTHONIOENCODING="ascii:strict")
+    mark = tmp_path / "stdio.json"
+    write(project, ".claude/verify.py", STDIO_SCRIPT.format(mark=str(mark), text=UNENCODABLE, rc=0))
+    r = run_hook(project, env=env)
+    assert json.loads(mark.read_text(encoding="utf-8"))["env"] == "ascii:strict"
+    assert r.blocked and "UnicodeEncodeError" in r.reason, r.reason      # 使用者要 strict 就是 strict
+
+
+def test_b3_only_python_overrides_get_the_error_handler(hook, tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    for name in ("verify", "verify.sh", "verify.cmd", "verify.bat"):
+        assert hook._override_env(tmp_path / name) is None, name
+    assert hook._override_env(tmp_path / "verify.py")["PYTHONIOENCODING"] == ":backslashreplace"
+    monkeypatch.setenv("PYTHONIOENCODING", "")                 # 空字串:Python 自己也當成沒設
+    assert hook._override_env(tmp_path / "verify.py")["PYTHONIOENCODING"] == ":backslashreplace"
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    assert hook._override_env(tmp_path / "verify.py") is None

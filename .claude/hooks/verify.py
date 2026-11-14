@@ -2536,6 +2536,16 @@ def _override_cmd(f):
     return [str(f)]  # .cmd / .bat / 無副檔名(需 +x)
 
 
+def _override_env(f):
+    """.py 自訂驗證:使用者沒設 PYTHONIOENCODING 時,輸出編碼照舊,只把錯誤處理改成 backslashreplace。
+    Windows 上導向管線的輸出用系統碼頁(CI 的 runner 是 cp1252),印出碼頁編不出的字會 UnicodeEncodeError,
+    整個驗證以失敗收場(第一次跨平台 CI 實測)。使用者自己設了就不動;空字串 Python 也當成沒設。
+    回傳 None = 照原樣繼承環境。"""
+    if f.suffix.lower() != ".py" or os.environ.get("PYTHONIOENCODING"):
+        return None
+    return dict(os.environ, PYTHONIOENCODING=":backslashreplace")
+
+
 def run_override(ctx, f):
     return [ctx.tool("override", f"專案自訂驗證 .claude/{f.name}", _override_cmd(f))]
 
@@ -2548,7 +2558,7 @@ BROAD_TOOLS = ("sh", "bash", "python3", "python", "node", "npm", "npx", "pytest"
 def spec_override(ctx, f):
     cmd = _override_cmd(f)
     label = f"專案自訂驗證 .claude/{f.name}"
-    run = lambda: [ctx.tool("override", label, cmd)]  # noqa: E731
+    run = lambda: [ctx.tool("override", label, cmd, env=_override_env(f))]  # noqa: E731
     if not ctx.cfg["override_cache"]:
         # 預設:自訂腳本讀什麼、依賴什麼完全不知道 → 每次都跑(Stage 1 行為)
         return dict(vid="override", label=label, run=run, env="",
