@@ -54,5 +54,5 @@ cat > "$DEST/settings.json" <<'JSON'
 }
 JSON
 
-echo "✅ 已裝到 $DEST。重啟 Claude Code,輸入 /hooks 應可見 Stop 事件。"
+echo "✅ 已裝到 ${DEST}。重啟 Claude Code,輸入 /hooks 應可見 Stop 事件。"
 echo "   (若你原本 settings.json 有其他設定,請從 .bak 合併回 hooks 區塊。)"

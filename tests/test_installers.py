@@ -3,12 +3,15 @@
 1. 三支腳本在 git 裡沒有執行權限(100644):照 README 執行 ./install-global.sh 在乾淨副本上 exit 126。
 2. scan-and-apply.sh --apply 套用失敗、自己的驗收也印出 ❌,結束碼卻是 0。
 3. install-global.sh 直接覆蓋使用者既有的 ~/.claude/CLAUDE.md,沒有備份。
+4. (CI 在 macOS 找到)install-global.sh 最後一行 `$DEST。`:macOS 的 bash 把「。」的第一個位元組當成
+   變數名稱的一部分,在 set -u 下 exit 1——檔案都裝好了,卻回報失敗。
 
 實際執行腳本的測試只在 POSIX 上跑(Windows 的 bash 在 runner 上可能解析成 WSL,不可靠)。
 HOME 一律指向暫存目錄,不碰真的 ~/.claude;git 的使用者身分與全域設定也指向暫存值。
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +61,18 @@ def test_installer_scripts_are_executable():
         assert all((ROOT / s).stat().st_mode & 0o111 == 0o111 for s in SCRIPTS), modes
     else:
         pytest.skip("POSIX 專屬:不在 git 工作樹時要看檔案系統的執行位元,Windows 沒有")
+
+
+def test_installer_scripts_have_no_variable_directly_followed_by_non_ascii():
+    # `$NAME` 後面直接接非 ASCII 字元時,bash 是否把那個位元組算進變數名稱取決於 locale 與 C 函式庫
+    # (macOS CI 實測會;Linux 的 UTF-8 locale 不會),所以在 Linux 上直接執行腳本抓不到,改成靜態檢查。
+    # 寫成 ${NAME} 就沒有歧義。註解與單引號字串裡的也算:寧可多擋,不靠判斷引號規則。
+    pattern = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7f])")
+    hits = [f"{s}:{n}: {line.strip()}"
+            for s in SCRIPTS
+            for n, line in enumerate((ROOT / s).read_text(encoding="utf-8").splitlines(), 1)
+            if pattern.search(line)]
+    assert not hits, "變數後面直接接非 ASCII 字元,請改成 ${NAME}:\n" + "\n".join(hits)
 
 
 @posix_only
