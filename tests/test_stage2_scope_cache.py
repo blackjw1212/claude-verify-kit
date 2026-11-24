@@ -373,6 +373,7 @@ def light_pair(project, fake):
 
 def test_independent_validators_run_in_parallel(project, fake):
     light_pair(project, fake)
+    configure(project, max_parallel=4)   # 預設 min(4, cpu_count):2 核時輕型只分到 1 格,兩個會依序跑
     r = run_hook(project, env=fake.env)
     c = fake.calls()
     assert overlap(intervals(c, "shellcheck")[0], intervals(c, "plutil")[0]), c
