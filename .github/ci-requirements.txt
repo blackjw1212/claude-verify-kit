@@ -1,0 +1,12 @@
+# CI 的測試相依(鎖到確切版本)。選擇理由(2026-11-04 查 PyPI 與 pytest 官方 changelog):
+#
+#   Python 3.10 以上 → pytest 9.2.0:目前最新版(2026-10-27),requires-python >=3.10,
+#     含 CVE-2025-71176(/tmp/pytest-of-<user> 的暫存目錄處理不安全)的修正(9.0.3 起)。
+#   Python 3.8       → pytest 8.3.5:最後一個支援 3.8 的版本(2025-03-02;8.4.0 起 requires-python >=3.9)。
+#     它早於上述修正,而且 8.3 系列不會再有新版。workflow 一律以 --basetemp 指到 job 專屬目錄,
+#     不使用 /tmp/pytest-of-<user>。3.8 本身已在 2024-10 結束支援,保留這一格是因為 hook 宣稱支援 3.8。
+#
+# 只鎖了 pytest 本身;它的相依(pluggy、iniconfig、packaging…)沒有鎖、也沒有雜湊。
+# 升級時兩件事一起看:新版的 requires-python,以及兩條線在本機各跑一次完整測試。
+pytest==8.3.5; python_version < "3.10"
+pytest==9.2.0; python_version >= "3.10"

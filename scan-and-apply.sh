@@ -109,11 +109,14 @@ echo
 echo "── 套用中 ──"
 # shellcheck disable=SC2086
 "$SRC/apply-to-repo.sh" ${PUSH} "${todo[@]}"
+apply_rc=$?
 
 # ── 4. 套用後驗收(本 session 踩過的坑,自動查一遍)────────────────────────
 echo
 echo "── 驗收 ──"
 fail=0
+# apply-to-repo.sh 本身沒跑起來(例如沒有執行權限)也算失敗,不能只靠下面逐 repo 的比對
+[ "$apply_rc" = 0 ] || { echo "  ❌ apply-to-repo.sh 結束碼 $apply_rc"; fail=1; }
 for r in "${todo[@]}"; do
   n="$(show "$r")"
   cd "$r" || continue
@@ -153,3 +156,6 @@ cat <<'NOTE'
   故意弄壞一個檢查 → 收工時閘門必須 block;還原後必須放行。
   先確認「弄壞後直接跑該檢查真的回非 0」,再拿去測閘門。
 NOTE
+
+# 驗收沒過就回非 0:呼叫端(CI、排程)只看結束碼,不能讓失敗看起來像成功
+exit "$fail"

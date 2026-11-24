@@ -7,6 +7,11 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="${HOME}/.claude"
 
 mkdir -p "$DEST/hooks" "$DEST/skills/codex-review"
+# 既有的 CLAUDE.md 與 kit 版不同時先備份:這是使用者自己的全域契約,覆蓋後就找不回來。
+if [ -f "$DEST/CLAUDE.md" ] && ! cmp -s "$SRC/CLAUDE.md" "$DEST/CLAUDE.md"; then
+  cp "$DEST/CLAUDE.md" "$DEST/CLAUDE.md.bak.$(date +%s)"
+  echo "ℹ️  已備份原有 CLAUDE.md"
+fi
 cp "$SRC/CLAUDE.md"                    "$DEST/CLAUDE.md"
 cp "$SRC/.claude/hooks/verify.py"      "$DEST/hooks/verify.py"
 cp "$SRC/.claude/hooks/plan-review.py" "$DEST/hooks/plan-review.py"
@@ -49,5 +54,5 @@ cat > "$DEST/settings.json" <<'JSON'
 }
 JSON
 
-echo "✅ 已裝到 $DEST。重啟 Claude Code,輸入 /hooks 應可見 Stop 事件。"
+echo "✅ 已裝到 ${DEST}。重啟 Claude Code,輸入 /hooks 應可見 Stop 事件。"
 echo "   (若你原本 settings.json 有其他設定,請從 .bak 合併回 hooks 區塊。)"
